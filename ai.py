@@ -28,10 +28,19 @@ ALLOW_UNTIL_MIDNIGHT = False
 # ===============================
 # 📊 连接 Google Sheets
 # ===============================
-scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+# ⚠️ 使用推荐的新版 scope，避免权限问题
+scope = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive'
+]
 creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
 client = gspread.authorize(creds)
-sheet = client.open('library-bot-sheet').sheet1
+try:
+    sheet = client.open('library-bot-sheet').sheet1
+    logging.info("✅ Connected to Google Sheets: library-bot-sheet / sheet1")
+except Exception as e:
+    logging.exception("❌ Failed to open Google Sheet. Check title/share/permissions.")
+    raise
 
 # ===============================
 # 📁 工具函数：表格操作
@@ -40,7 +49,38 @@ def get_all_bookings():
     return sheet.get_all_records()
 
 def append_booking(student_id, category, size, date_str, time_str):
-    sheet.append_row([student_id, category, size, date_str, time_str])
+    try:
+        row = [student_id, category, size, date_str, time_str]
+        sheet.append_row(row)
+        logging.info(f"📝 Appended row: {row}")
+        return True
+    except Exception as e:
+        logging.exception("❌ append_booking failed")
+        return False
+    
+    
+# ===============================
+# 🧰 Context 工具：读取/合并/写回 booking_info
+# ===============================
+def _get_ctx_params(req, ctx_name='booking_info'):
+    for c in req['queryResult'].get('outputContexts', []):
+        if ctx_name in c.get('name', ''):
+            return c.get('parameters', {}) or {}
+    return {}
+
+def _merge_ctx_params(old_params: dict, new_params: dict) -> dict:
+    merged = dict(old_params or {})
+    for k, v in (new_params or {}).items():
+        if v not in (None, "", []):  # 仅在新值有效时覆盖
+            merged[k] = v
+    return merged
+
+def _ctx_obj(req, params: dict, ctx_name='booking_info', lifespan=5):
+    return {
+        "name": f"{req['session']}/contexts/{ctx_name}",
+        "lifespanCount": lifespan,
+        "parameters": params
+    }
 
 # ===============================
 # 🚣 回应文本集中管理
@@ -139,21 +179,17 @@ def handle_check_availability(req):
         return jsonify({"fulfillmentText": RESPONSE['missing_date']})
     date_str = date_obj.strftime("%d/%m/%Y")
 
-    # ✅ 缺时间 → 追问时间并保留上下文
+    # ✅ 缺时间 → 追问时间并保留上下文（合并旧值，防丢参）
     if not time_period:
+        old = _get_ctx_params(req, 'booking_info')
+        merged = _merge_ctx_params(old, {
+            "roomCategory": room_category,
+            "roomSize": room_size,
+            "date": date_str
+        })
         return jsonify({
             "fulfillmentText": f"Great. For {date_str}, {RESPONSE['missing_time']}",
-            "outputContexts": [
-                {
-                    "name": f"{req['session']}/contexts/booking_info",
-                    "lifespanCount": 5,
-                    "parameters": {
-                        "roomCategory": room_category,
-                        "roomSize": room_size,
-                        "date": date_str
-                    }
-                }
-            ]
+            "outputContexts": [_ctx_obj(req, merged, 'booking_info', lifespan=5)]
         })
 
     # ✅ 已给时间但没给人数 → 先做时长校验，再追问人数，并保留时间到 context
@@ -161,36 +197,28 @@ def handle_check_availability(req):
     if not ok:
         return jsonify({"fulfillmentText": msg})
     if not room_size:
+        old = _get_ctx_params(req, 'booking_info')
+        merged = _merge_ctx_params(old, {
+            "roomCategory": room_category,
+            "date": date_str,
+            "booking_time": time_period
+        })
         return jsonify({
             "fulfillmentText": RESPONSE['missing_people'],
-            "outputContexts": [
-                {
-                    "name": f"{req['session']}/contexts/booking_info",
-                    "lifespanCount": 5,
-                    "parameters": {
-                        "roomCategory": room_category,
-                        "date": date_str,
-                        "booking_time": time_period
-                    }
-                }
-            ]
+            "outputContexts": [_ctx_obj(req, merged, 'booking_info', lifespan=5)]
         })
 
-    # 🔄 都齐了就正常回应
+    # 🔄 都齐了就正常回应（也把信息写回 context）
+    old = _get_ctx_params(req, 'booking_info')
+    merged = _merge_ctx_params(old, {
+        "roomCategory": room_category,
+        "roomSize": room_size,
+        "date": date_str,
+        "booking_time": time_period
+    })
     return jsonify({
         "fulfillmentText": f"Let me check availability for a {room_category} room for {room_size} people on {date_str} from {time_str}. Yes to Confirm, No to Cancel.",
-        "outputContexts": [
-            {
-                "name": f"{req['session']}/contexts/booking_info",
-                "lifespanCount": 5,
-                "parameters": {
-                    "roomCategory": room_category,
-                    "roomSize": room_size,
-                    "date": date_str,
-                    "booking_time": time_period
-                }
-            }
-        ]
+        "outputContexts": [_ctx_obj(req, merged, 'booking_info', lifespan=5)]
     })
 
 def handle_book_room(req):
@@ -230,19 +258,19 @@ def handle_book_room(req):
     if not ok:
         return jsonify({"fulfillmentText": msg})
 
-    # 👤 人数/房型联动
-    if room_size is None and room_category == 'solo':
-        room_size = 1
+    # 👤 人数/房型联动（纯数字）
+    people = None
     try:
         people = int(room_size) if room_size is not None else None
     except Exception:
         return jsonify({"fulfillmentText": "⚠ Please provide a valid number of people."})
 
-    if people is not None and people == 1 and not room_category:
+    if people == 1 and not room_category:
         room_category = 'solo'
-    if people is not None and people >= 2 and not room_category:
+    elif people is not None and people >= 2 and not room_category:
         room_category = 'discussion'
-    if room_category == 'solo' and (people is None):
+
+    if room_category == 'solo' and people is None:
         people = 1
 
     # ✅ 检查是否已预约该日
@@ -251,24 +279,19 @@ def handle_book_room(req):
             return jsonify({"fulfillmentText": RESPONSE['already_booked']})
 
     # ✅ 输出确认 + 设置 context（附带 awaiting_confirmation，便于“no/yes”意图触发）
+    old = _get_ctx_params(req, 'booking_info')
+    merged = _merge_ctx_params(old, {
+        "student_id": student_id,
+        "roomCategory": room_category,
+        "roomSize": people,
+        "date": date_str,
+        "time": time_str
+    })
     return jsonify({
         "fulfillmentText": RESPONSE['confirm'].format(room_category, people, date_str, time_str),
         "outputContexts": [
-            {
-                "name": f"{req['session']}/contexts/booking_info",
-                "lifespanCount": 5,
-                "parameters": {
-                    "student_id": student_id,
-                    "roomCategory": room_category,
-                    "roomSize": people,
-                    "date": date_str,
-                    "time": time_str
-                }
-            },
-            {
-                "name": f"{req['session']}/contexts/awaiting_confirmation",
-                "lifespanCount": 5
-            }
+            _ctx_obj(req, merged, 'booking_info', lifespan=5),
+            {"name": f"{req['session']}/contexts/awaiting_confirmation", "lifespanCount": 5}
         ]
     })
 
@@ -287,9 +310,34 @@ def handle_confirm_booking(req):
             time_str = clean(params.get('time'))
             break
 
+    # 学号缺失时由 webhook 追问（避免 DF slot-filling 抢问）
+    if not student_id:
+        old = _get_ctx_params(req, 'booking_info')
+        return jsonify({
+            "fulfillmentText": "Please enter your 7-digit student ID to complete the booking.",
+            "outputContexts": [
+                _ctx_obj(req, old, 'booking_info', lifespan=5),
+                {"name": f"{req['session']}/contexts/awaiting_confirmation", "lifespanCount": 5}
+            ]
+        })
+
+    # 学号格式再校验一层
+    if not str(student_id).isdigit() or len(str(student_id)) != 7:
+        old = _get_ctx_params(req, 'booking_info')
+        return jsonify({
+            "fulfillmentText": "⚠ Invalid student ID format. Must be 7-digit number.",
+            "outputContexts": [
+                _ctx_obj(req, old, 'booking_info', lifespan=5),
+                {"name": f"{req['session']}/contexts/awaiting_confirmation", "lifespanCount": 5}
+            ]
+        })
+
     if all([student_id, room_category, room_size, date_str, time_str]):
-        append_booking(student_id, room_category, room_size, date_str, time_str)
-        return jsonify({"fulfillmentText": RESPONSE['confirm_success']})
+        ok = append_booking(student_id, room_category, room_size, date_str, time_str)
+        if ok:
+            return jsonify({"fulfillmentText": RESPONSE['confirm_success']})
+        else:
+            return jsonify({"fulfillmentText": "⚠ I couldn't save your booking to the sheet. Please try again later or contact staff."})
     else:
         return jsonify({"fulfillmentText": RESPONSE['confirm_failed']})
 
