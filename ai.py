@@ -26,19 +26,33 @@ CORS(app)
 ALLOW_UNTIL_MIDNIGHT = False
 
 # ===============================
-# 📊 连接 Google Sheets
+# 📊 连接 Google Sheets（确保表头一致）
 # ===============================
-# ⚠️ 使用推荐的新版 scope，避免权限问题
 scope = [
     'https://www.googleapis.com/auth/spreadsheets',
     'https://www.googleapis.com/auth/drive'
 ]
 creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
 client = gspread.authorize(creds)
+
+SHEET_TITLE = 'library-bot-sheet'
+REQUIRED_HEADERS = ["Student ID", "Category", "Size", "Date", "Time"]
+
+def _ensure_headers(ws):
+    try:
+        first_row = ws.row_values(1)
+        if first_row != REQUIRED_HEADERS:
+            ws.resize(rows=max(ws.row_count, 1), cols=len(REQUIRED_HEADERS))
+            ws.update('A1:E1', [REQUIRED_HEADERS])
+            logging.info(f"✅ Headers ensured: {REQUIRED_HEADERS}")
+    except Exception:
+        logging.exception("❌ Failed to ensure headers on sheet")
+
 try:
-    sheet = client.open('library-bot-sheet').sheet1
-    logging.info("✅ Connected to Google Sheets: library-bot-sheet / sheet1")
-except Exception as e:
+    sheet = client.open(SHEET_TITLE).sheet1
+    _ensure_headers(sheet)
+    logging.info(f"✅ Connected to Google Sheets: {SHEET_TITLE} / sheet1")
+except Exception:
     logging.exception("❌ Failed to open Google Sheet. Check title/share/permissions.")
     raise
 
@@ -54,11 +68,10 @@ def append_booking(student_id, category, size, date_str, time_str):
         sheet.append_row(row)
         logging.info(f"📝 Appended row: {row}")
         return True
-    except Exception as e:
+    except Exception:
         logging.exception("❌ append_booking failed")
         return False
-    
-    
+
 # ===============================
 # 🧰 Context 工具：读取/合并/写回 booking_info
 # ===============================
@@ -86,21 +99,31 @@ def _ctx_obj(req, params: dict, ctx_name='booking_info', lifespan=5):
 # 🚣 回应文本集中管理
 # ===============================
 RESPONSE = {
-    "welcome": "Hi! Welcome to the Library Booking Bot.",
+    "welcome": (
+        "Hi! Welcome to the Library Booking Bot. How can I assist you?\n"
+        "1️⃣ Check availability\n"
+        "2️⃣ Make a booking\n"
+        "3️⃣ Cancel a booking\n"
+        "4️⃣ Library information\n\n"
+        "👉 You can either type the number OR just tell me directly (e.g. 'I want to book a room tomorrow at 2 PM')."
+    ),
     "already_booked": "⚠ You have already booked a room for that day. One booking per day is allowed.",
     "invalid_date": "⚠ Invalid date format: {}",
     "invalid_time": "⚠ Invalid time format. Please enter both start and end time clearly.",
     "outside_hours": "⚠ Booking time must be between 8 AM and 10 PM (or 12 AM during exam period).",
     "too_long": "⚠ You can only book up to 3 hours per session.",
+    "missing_date_checkAvailability": "⚠ Please tell me which date you want to check. Today or tomorrow?",
     "missing_date": "⚠ Please tell me which date you want to book. Today or tomorrow?",
     "missing_time": "⚠ What time would you like to book? (e.g. 2 PM to 5 PM)",
+    "missing_time_checkAvailability": "⚠ What time would you like to check availability for? (e.g. 2 PM to 5 PM)",
     "missing_people": "How many people will be using the room?",
     "confirm": "Let me confirm: You want to book a {} room for {} people on {} from {}, right? Please say 'Yes' to confirm.",
     "confirm_success": "✅ Your booking has been saved successfully.",
     "confirm_failed": "⚠ Booking failed. Missing information.",
     "cancel": "🖑 Your booking has been cancelled.",
     "unknown": "Sorry, I didn’t understand that.",
-    "cancel_confirm": "Got it. The booking has been cancelled. If you'd like to book again, just let me know!"
+    "cancel_confirm": "Got it. The booking has been cancelled. If you'd like to book again, just let me know!",
+    "library_info": "Library hours: 8:00 AM – 10:00 PM daily. Solo rooms fit 1 person; discussion rooms fit 2–6 people."
 }
 
 # ===============================
@@ -122,7 +145,7 @@ def parse_date(date_param):
             else:
                 dt = parser.isoparse(date_param)
                 return dt.date()
-    except Exception as e:
+    except Exception:
         logging.exception("Date parsing error")
         return None
 
@@ -161,11 +184,43 @@ def parse_and_validate_timeperiod(time_period):
         return False, RESPONSE['invalid_time'], None
 
 # ===============================
-# 🤖 意图处理函数
+# 🤖 意图处理函数 —— 欢迎与菜单（新增）
 # ===============================
 def handle_welcome(req):
-    return jsonify({"fulfillmentText": RESPONSE['welcome']})
+    # 逐行发送 + 设置 awaiting_menu，仅菜单场景生效
+    lines = [ln for ln in RESPONSE['welcome'].split("\n") if ln.strip()]
+    return jsonify({
+        "fulfillmentMessages": [{"text": {"text": [ln]}} for ln in lines],
+        "outputContexts": [
+            {"name": f"{req['session']}/contexts/awaiting_menu", "lifespanCount": 5}
+        ]
+    })
 
+def _menu_followup(req, event_name: str):
+    return jsonify({
+        "followupEventInput": {
+            "name": event_name,
+            "languageCode": "en",
+            "parameters": _get_ctx_params(req, 'booking_info')
+        }
+    })
+
+def handle_menu_check(req):   # Menu_CheckAvailability → EVT_CHECK
+    return _menu_followup(req, "EVT_CHECK")
+
+def handle_menu_book(req):    # Menu_BookRoom → EVT_BOOK
+    return _menu_followup(req, "EVT_BOOK")
+
+def handle_menu_cancel(req):  # Menu_CancelBooking → EVT_CANCEL
+    return _menu_followup(req, "EVT_CANCEL")
+
+def handle_menu_info(req):    # Menu_LibraryInfo → EVT_INFO（或直接返回信息）
+    # 这里直接回文本；若你在 LibraryInfo 业务 Intent 里配置了 EVT_INFO，也可以用事件跳转
+    return jsonify({"fulfillmentText": RESPONSE["library_info"]})
+
+# ===============================
+# 🤖 业务意图处理函数（保持原逻辑）
+# ===============================
 def handle_check_availability(req):
     parameters = req['queryResult'].get('parameters', {})
     room_category = parameters.get('room_category')
@@ -176,10 +231,10 @@ def handle_check_availability(req):
     # 👉 解析日期
     date_obj = parse_date(date_param)
     if not date_obj:
-        return jsonify({"fulfillmentText": RESPONSE['missing_date']})
+        return jsonify({"fulfillmentText": RESPONSE['missing_date_checkAvailability']})
     date_str = date_obj.strftime("%d/%m/%Y")
 
-    # ✅ 缺时间 → 追问时间并保留上下文（合并旧值，防丢参）
+    # ✅ 缺时间 → 追问时间并保留上下文
     if not time_period:
         old = _get_ctx_params(req, 'booking_info')
         merged = _merge_ctx_params(old, {
@@ -188,7 +243,7 @@ def handle_check_availability(req):
             "date": date_str
         })
         return jsonify({
-            "fulfillmentText": f"Great. For {date_str}, {RESPONSE['missing_time']}",
+            "fulfillmentText": f"For {date_str}, {RESPONSE['missing_time_checkAvailability']}",
             "outputContexts": [_ctx_obj(req, merged, 'booking_info', lifespan=5)]
         })
 
@@ -310,7 +365,6 @@ def handle_confirm_booking(req):
             time_str = clean(params.get('time'))
             break
 
-    # 学号缺失时由 webhook 追问（避免 DF slot-filling 抢问）
     if not student_id:
         old = _get_ctx_params(req, 'booking_info')
         return jsonify({
@@ -321,7 +375,6 @@ def handle_confirm_booking(req):
             ]
         })
 
-    # 学号格式再校验一层
     if not str(student_id).isdigit() or len(str(student_id)) != 7:
         old = _get_ctx_params(req, 'booking_info')
         return jsonify({
@@ -345,8 +398,10 @@ def handle_cancel_booking(req):
     return jsonify({"fulfillmentText": RESPONSE['cancel']})
 
 def handle_cancel_after_confirmation(req):
-    # “No / cancel” 在确认阶段触发此意图
     return jsonify({"fulfillmentText": RESPONSE['cancel_confirm']})
+
+def handle_library_info(req):
+    return jsonify({"fulfillmentText": RESPONSE["library_info"]})
 
 def handle_default(req):
     return jsonify({"fulfillmentText": RESPONSE['unknown']})
@@ -355,13 +410,20 @@ def handle_default(req):
 # 🧠 意图对应表
 # ===============================
 INTENT_HANDLERS = {
+    # 欢迎 + 菜单
     'Welcome': handle_welcome,
+    'Menu_CheckAvailability': handle_menu_check,
+    'Menu_BookRoom': handle_menu_book,
+    'Menu_CancelBooking': handle_menu_cancel,
+    'Menu_LibraryInfo': handle_menu_info,
+
+    # 业务意图
     'CheckAvailability': handle_check_availability,
     'book_room': handle_book_room,
     'ConfirmBooking': handle_confirm_booking,
     'CancelBooking': handle_cancel_booking,
     'CancelAfterConfirmation': handle_cancel_after_confirmation,
-    'RejectConfirmation': handle_cancel_after_confirmation  # 提供为 "No" 的捕捉
+    'LibraryInfo': handle_library_info  # 如果 LibraryInfo 用静态响应，这行可以不加
 }
 
 # ===============================
@@ -374,6 +436,18 @@ def webhook():
     logging.info(f"Incoming intent: {intent}, parameters: {req['queryResult'].get('parameters')}")
     handler = INTENT_HANDLERS.get(intent, handle_default)
     return handler(req)
+
+# （可选）调试端点：快速验证是否能写入 Google Sheet
+@app.route('/debug/test-sheets', methods=['GET'])
+def debug_test_sheets():
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        test_row = ["9999999", "debug", 0, ts, "00:00–00:30"]
+        sheet.append_row(test_row)
+        return jsonify({"ok": True, "wrote": test_row})
+    except Exception as e:
+        logging.exception("❌ /debug/test-sheets failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 # ===============================
 # ▶️ 本地启动
