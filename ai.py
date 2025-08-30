@@ -1,32 +1,32 @@
 # ===============================
-# 📦 导入模块：Flask + Google Sheets + 时间解析
+# 📦 导入模块
 # ===============================
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, time as dtime
 from dateutil import parser
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import logging
 
 # ===============================
-# 📜 日志设置
+# 📜 日志配置
 # ===============================
 logging.basicConfig(level=logging.INFO)
 
 # ===============================
-# 🚀 初始化 Flask 应用
+# 🚀 Flask 应用
 # ===============================
 app = Flask(__name__)
 CORS(app)
 
 # ===============================
-# ⏰ 设置允许时间（考试期间延长时段）
+# ⏰ 开放时间（考试期间可设置到 24:00）
 # ===============================
 ALLOW_UNTIL_MIDNIGHT = False
 
 # ===============================
-# 📊 连接 Google Sheets（确保表头一致）
+# 📊 Google Sheets 连接
 # ===============================
 scope = [
     'https://www.googleapis.com/auth/spreadsheets',
@@ -38,6 +38,7 @@ client = gspread.authorize(creds)
 SHEET_TITLE = 'library-bot-sheet'
 REQUIRED_HEADERS = ["Student ID", "Category", "Size", "Date", "Time"]
 
+# 确保表头存在
 def _ensure_headers(ws):
     try:
         first_row = ws.row_values(1)
@@ -56,9 +57,7 @@ except Exception:
     logging.exception("❌ Failed to open Google Sheet. Check title/share/permissions.")
     raise
 
-# ===============================
-# 📁 工具函数：表格操作
-# ===============================
+# 工具函数：读取和写入 Google Sheets
 def get_all_bookings():
     return sheet.get_all_records()
 
@@ -73,22 +72,35 @@ def append_booking(student_id, category, size, date_str, time_str):
         return False
 
 # ===============================
-# 🧰 Context 工具：读取/合并/写回 booking_info
+# 🧱 上下文名称定义
 # ===============================
-def _get_ctx_params(req, ctx_name='booking_info'):
+CTX_MENU = "awaiting_menu"            
+CTX_BOOKING = "booking_info"          
+CTX_CHECK_FLOW = "check_flow"         
+CTX_READY_TO_BOOK = "ready_to_book"   
+CTX_AWAIT_CONFIRM = "awaiting_confirmation"  
+
+# 工具函数：获取、合并、构建 context
+def _get_ctx_params(req, ctx_name=CTX_BOOKING):
     for c in req['queryResult'].get('outputContexts', []):
         if ctx_name in c.get('name', ''):
             return c.get('parameters', {}) or {}
     return {}
 
+def _has_ctx(req, ctx_name):
+    for c in req['queryResult'].get('outputContexts', []):
+        if ctx_name in c.get('name', '') and c.get('lifespanCount', 0) > 0:
+            return True
+    return False
+
 def _merge_ctx_params(old_params: dict, new_params: dict) -> dict:
     merged = dict(old_params or {})
     for k, v in (new_params or {}).items():
-        if v not in (None, "", []):  # 仅在新值有效时覆盖
+        if v not in (None, "", []):
             merged[k] = v
     return merged
 
-def _ctx_obj(req, params: dict, ctx_name='booking_info', lifespan=5):
+def _ctx_obj(req, params: dict, ctx_name=CTX_BOOKING, lifespan=5):
     return {
         "name": f"{req['session']}/contexts/{ctx_name}",
         "lifespanCount": lifespan,
@@ -96,38 +108,38 @@ def _ctx_obj(req, params: dict, ctx_name='booking_info', lifespan=5):
     }
 
 # ===============================
-# 🚣 回应文本集中管理
+# 🤖 回复文本（英文）
 # ===============================
 RESPONSE = {
     "welcome": (
-        "Hi! Welcome to the Library Booking Bot. How can I assist you?\n"
+        "Hi! Welcome to the Library Booking Bot.\n"
         "1️⃣ Check availability\n"
         "2️⃣ Make a booking\n"
         "3️⃣ Cancel a booking\n"
         "4️⃣ Library information\n\n"
-        "👉 You can either type the number OR just tell me directly (e.g. 'I want to book a room tomorrow at 2 PM')."
+        "👉 You can type a number or say: 'I want to book tomorrow at 2 PM'."
     ),
-    "already_booked": "⚠ You have already booked a room for that day. One booking per day is allowed.",
+    "already_booked": "⚠ You already booked for that day (one per day).",
     "invalid_date": "⚠ Invalid date format: {}",
-    "invalid_time": "⚠ Invalid time format. Please enter both start and end time clearly.",
-    "outside_hours": "⚠ Booking time must be between 8 AM and 10 PM (or 12 AM during exam period).",
+    "invalid_time": "⚠ Invalid time format. Please provide both start and end clearly.",
+    "outside_hours": "⚠ Booking time must be between 8 AM and 10 PM (or until midnight during exam period).",
     "too_long": "⚠ You can only book up to 3 hours per session.",
-    "missing_date_checkAvailability": "⚠ Please tell me which date you want to check. Today or tomorrow?",
-    "missing_date": "⚠ Please tell me which date you want to book. Today or tomorrow?",
-    "missing_time": "⚠ What time would you like to book? (e.g. 2 PM to 5 PM)",
-    "missing_time_checkAvailability": "⚠ What time would you like to check availability for? (e.g. 2 PM to 5 PM)",
+    "missing_date_checkAvailability": "⚠ Which date do you want to check? Today or tomorrow?",
+    "missing_date": "⚠ Please provide a date: today or tomorrow?",
+    "missing_time": "⚠ Please provide a time range, e.g. 2 PM to 5 PM.",
+    "missing_time_checkAvailability": "⚠ What time would you like to check? For example: 2 PM to 5 PM.",
     "missing_people": "How many people will be using the room?",
-    "confirm": "Let me confirm: You want to book a {} room for {} people on {} from {}, right? Please say 'Yes' to confirm.",
+    "confirm": "Let me confirm: You want to book a {} room for {} people on {} from {}, correct? Say 'Yes' to confirm.",
     "confirm_success": "✅ Your booking has been saved successfully.",
     "confirm_failed": "⚠ Booking failed. Missing information.",
     "cancel": "🖑 Your booking has been cancelled.",
     "unknown": "Sorry, I didn’t understand that.",
-    "cancel_confirm": "Got it. The booking has been cancelled. If you'd like to book again, just let me know!",
+    "cancel_confirm": "Got it. The booking has been cancelled.",
     "library_info": "Library hours: 8:00 AM – 10:00 PM daily. Solo rooms fit 1 person; discussion rooms fit 2–6 people."
 }
 
 # ===============================
-# 🗓 分析日期字段（统一返回 date 对象）
+# 🗓 日期解析
 # ===============================
 def parse_date(date_param):
     if not date_param:
@@ -150,109 +162,179 @@ def parse_date(date_param):
         return None
 
 # ===============================
-# ⏱️ 工具函数：解析与校验时间段
+# ⏱ 时间段解析与校验
 # ===============================
 def parse_and_validate_timeperiod(time_period):
     """
-    返回 (ok: bool, message: str|None, time_str: str|None)
-    - 校验 8:00-22:00（或 24:00），最长 3 小时
-    - 成功则返回 12 小时制 time_str
+    返回: (ok: bool, msg: str|None, time_str: str|None, start_obj, end_obj)
+      - 必须在同一天
+      - 8:00 ≤ start < end ≤ 22:00（考试期 ≤ 24:00）
+      - 时长 ≤ 3 小时
     """
     if not time_period or not isinstance(time_period, dict):
-        return False, RESPONSE['missing_time'], None
+        return False, RESPONSE['missing_time'], None, None, None
+
     start_time = time_period.get('startTime')
     end_time = time_period.get('endTime')
     if not start_time or not end_time:
-        return False, RESPONSE['missing_time'], None
+        return False, RESPONSE['missing_time'], None, None, None
+
     try:
         start_obj = parser.isoparse(start_time)
         end_obj = parser.isoparse(end_time)
 
-        opening_time = 8
-        closing_time = 24 if ALLOW_UNTIL_MIDNIGHT else 22
-        if not (opening_time <= start_obj.hour < closing_time and opening_time < end_obj.hour <= closing_time):
-            return False, RESPONSE['outside_hours'], None
+        if start_obj.date() != end_obj.date():
+            return False, RESPONSE['invalid_time'], None, None, None
 
-        duration = (end_obj - start_obj).total_seconds() / 3600
-        if duration > 3:
-            return False, RESPONSE['too_long'], None
+        opening = dtime(8, 0, 0)
+        closing_hour = 24 if ALLOW_UNTIL_MIDNIGHT else 22
+        closing = dtime(closing_hour % 24, 0, 0)
+
+        if not (opening <= start_obj.time() < end_obj.time() <= closing):
+            return False, RESPONSE['outside_hours'], None, None, None
+
+        duration_hours = (end_obj - start_obj).total_seconds() / 3600.0
+        if duration_hours - 3.0 > 1e-6:
+            return False, RESPONSE['too_long'], None, None, None
 
         time_str = f"{start_obj.strftime('%I:%M %p')} to {end_obj.strftime('%I:%M %p')}"
-        return True, None, time_str
+        return True, None, time_str, start_obj, end_obj
+
     except Exception:
         logging.exception("Time parsing failed")
-        return False, RESPONSE['invalid_time'], None
+        return False, RESPONSE['invalid_time'], None, None, None
 
 # ===============================
-# 🤖 意图处理函数 —— 欢迎与菜单（新增）
+# 🤖 Welcome + Menu
 # ===============================
 def handle_welcome(req):
-    # 逐行发送 + 设置 awaiting_menu，仅菜单场景生效
+    # 多行菜单回复
     lines = [ln for ln in RESPONSE['welcome'].split("\n") if ln.strip()]
     return jsonify({
         "fulfillmentMessages": [{"text": {"text": [ln]}} for ln in lines],
         "outputContexts": [
-            {"name": f"{req['session']}/contexts/awaiting_menu", "lifespanCount": 5}
+            {"name": f"{req['session']}/contexts/{CTX_MENU}", "lifespanCount": 5}
         ]
     })
 
-def _menu_followup(req, event_name: str):
+def _menu_followup(req, event_name: str, text: str):
     return jsonify({
+        "fulfillmentText": text,
         "followupEventInput": {
             "name": event_name,
             "languageCode": "en",
-            "parameters": _get_ctx_params(req, 'booking_info')
+            "parameters": _get_ctx_params(req, CTX_BOOKING)
         }
     })
 
-def handle_menu_check(req):   # Menu_CheckAvailability → EVT_CHECK
-    return _menu_followup(req, "EVT_CHECK")
+def handle_menu_check(req):
+    fresh = {"booking_time": None}
+    return jsonify({
+        "fulfillmentText": "Entering availability check. Which date would you like to check — today or tomorrow?",
+        "outputContexts": [
+            _ctx_obj(req, fresh, CTX_BOOKING, lifespan=5),
+            _ctx_obj(req, {}, CTX_CHECK_FLOW, lifespan=5),
+            {"name": f"{req['session']}/contexts/{CTX_MENU}", "lifespanCount": 0},
+            {"name": f"{req['session']}/contexts/{CTX_READY_TO_BOOK}", "lifespanCount": 0}
+        ],
+        "followupEventInput": {"name": "EVT_CHECK", "languageCode": "en"}
+    })
 
-def handle_menu_book(req):    # Menu_BookRoom → EVT_BOOK
-    return _menu_followup(req, "EVT_BOOK")
+def handle_menu_book(req):
+    if not _has_ctx(req, CTX_READY_TO_BOOK):
+        return jsonify({
+            "fulfillmentText": "Let's check availability first. Which date would you like — today or tomorrow?",
+            "outputContexts": [
+                _ctx_obj(req, {}, CTX_CHECK_FLOW, lifespan=5)
+            ]
+        })
+    return _menu_followup(req, "EVT_BOOK", "Proceeding to booking. Please enter your 7-digit student ID.")
 
-def handle_menu_cancel(req):  # Menu_CancelBooking → EVT_CANCEL
-    return _menu_followup(req, "EVT_CANCEL")
+def handle_menu_cancel(req):
+    return _menu_followup(req, "EVT_CANCEL", "Okay, let's cancel a booking. Please provide your 7-digit student ID and the date.")
 
-def handle_menu_info(req):    # Menu_LibraryInfo → EVT_INFO（或直接返回信息）
-    # 这里直接回文本；若你在 LibraryInfo 业务 Intent 里配置了 EVT_INFO，也可以用事件跳转
+def handle_menu_info(req):
     return jsonify({"fulfillmentText": RESPONSE["library_info"]})
 
 # ===============================
-# 🤖 业务意图处理函数（保持原逻辑）
+# 🔎 CheckAvailability（检查可用性）
 # ===============================
 def handle_check_availability(req):
+    # 确保进入查询流程上下文
+    if not _has_ctx(req, CTX_CHECK_FLOW):
+        return jsonify({
+            "fulfillmentText": "We'll check availability now. Which date would you like — today or tomorrow?",
+            "outputContexts": [
+                _ctx_obj(req, {}, CTX_CHECK_FLOW, lifespan=5)
+            ]
+        })
+
     parameters = req['queryResult'].get('parameters', {})
     room_category = parameters.get('room_category')
     room_size = parameters.get('room_size')
     date_param = parameters.get('date') or parameters.get('date-time')
     time_period = parameters.get('booking_time')
 
-    # 👉 解析日期
-    date_obj = parse_date(date_param)
-    if not date_obj:
-        return jsonify({"fulfillmentText": RESPONSE['missing_date_checkAvailability']})
-    date_str = date_obj.strftime("%d/%m/%Y")
+    # ===============================
+    # 🕒 ❶ 判断用户是否明确输入了时间（没有就丢弃旧的）
+    # ===============================
+    user_text = (req['queryResult'].get('queryText') or '').lower()
+    has_time_words = any(w in user_text for w in [' to ', '-', 'from', 'until', 'pm', 'am', ':'])
+    if not has_time_words:
+        time_period = None
 
-    # ✅ 缺时间 → 追问时间并保留上下文
-    if not time_period:
-        old = _get_ctx_params(req, 'booking_info')
+    # ===============================
+    # 🕒 ❷ 校验时间（如果输入了时间，先验证是否合法）
+    # ===============================
+    if time_period:
+        ok, msg, _, _, _ = parse_and_validate_timeperiod(time_period)
+        if not ok:
+            old = _get_ctx_params(req, CTX_BOOKING)
+            merged = _merge_ctx_params(old, {
+                "roomCategory": room_category,
+                "roomSize": room_size,
+                "date": old.get("date"),   # ⚠ 保留已有日期
+                "booking_time": None       # ❌ 清掉错误时间
+            })
+            return jsonify({
+                "fulfillmentText": f"{msg} Please enter a new time period within opening hours, max 3 hours (e.g. 2 PM to 5 PM).",
+                "outputContexts": [
+                    _ctx_obj(req, merged, CTX_BOOKING, lifespan=5),
+                    _ctx_obj(req, {}, CTX_CHECK_FLOW, lifespan=5)
+                ]
+            })
+
+    # ===============================
+    # 📅 ❸ 校验日期（新增逻辑：优先复用 context 里的日期）
+    # ===============================
+    old = _get_ctx_params(req, CTX_BOOKING)
+    date_obj = parse_date(date_param)
+
+    if not date_obj and old.get("date"):
+        # ✅ 如果 context 里已经存了日期，就直接复用，不要再问
+        date_obj = parse_date(old.get("date"))
+
+    if not date_obj:
+        # ❌ 如果用户和 context 都没有日期 → 必须追问
         merged = _merge_ctx_params(old, {
             "roomCategory": room_category,
             "roomSize": room_size,
-            "date": date_str
+            "booking_time": time_period   # ⚠ 保留已通过校验的时间，避免重复输入
         })
         return jsonify({
-            "fulfillmentText": f"For {date_str}, {RESPONSE['missing_time_checkAvailability']}",
-            "outputContexts": [_ctx_obj(req, merged, 'booking_info', lifespan=5)]
+            "fulfillmentText": RESPONSE['missing_date_checkAvailability'],
+            "outputContexts": [
+                _ctx_obj(req, merged, CTX_BOOKING, lifespan=5),
+                _ctx_obj(req, {}, CTX_CHECK_FLOW, lifespan=5)
+            ]
         })
 
-    # ✅ 已给时间但没给人数 → 先做时长校验，再追问人数，并保留时间到 context
-    ok, msg, time_str = parse_and_validate_timeperiod(time_period)
-    if not ok:
-        return jsonify({"fulfillmentText": msg})
+    date_str = date_obj.strftime("%d/%m/%Y")
+
+    # ===============================
+    # 👥 ❹ 人数缺失 → 追问
+    # ===============================
     if not room_size:
-        old = _get_ctx_params(req, 'booking_info')
         merged = _merge_ctx_params(old, {
             "roomCategory": room_category,
             "date": date_str,
@@ -260,11 +342,16 @@ def handle_check_availability(req):
         })
         return jsonify({
             "fulfillmentText": RESPONSE['missing_people'],
-            "outputContexts": [_ctx_obj(req, merged, 'booking_info', lifespan=5)]
+            "outputContexts": [
+                _ctx_obj(req, merged, CTX_BOOKING, lifespan=5),
+                _ctx_obj(req, {}, CTX_CHECK_FLOW, lifespan=5)
+            ]
         })
 
-    # 🔄 都齐了就正常回应（也把信息写回 context）
-    old = _get_ctx_params(req, 'booking_info')
+    # ===============================
+    # ✅ ❺ 信息齐全 → 下发 ready_to_book
+    # ===============================
+    ok, msg, time_str, _, _ = parse_and_validate_timeperiod(time_period)
     merged = _merge_ctx_params(old, {
         "roomCategory": room_category,
         "roomSize": room_size,
@@ -272,11 +359,25 @@ def handle_check_availability(req):
         "booking_time": time_period
     })
     return jsonify({
-        "fulfillmentText": f"Let me check availability for a {room_category} room for {room_size} people on {date_str} from {time_str}. Yes to Confirm, No to Cancel.",
-        "outputContexts": [_ctx_obj(req, merged, 'booking_info', lifespan=5)]
+        "fulfillmentText": f"Great. I have a {room_category} room for {room_size} people on {date_str} from {time_str}. Say 'Book' to proceed.",
+        "outputContexts": [
+            _ctx_obj(req, merged, CTX_BOOKING, lifespan=10),
+            _ctx_obj(req, {}, CTX_READY_TO_BOOK, lifespan=3)
+        ]
     })
 
+# ===============================
+# 🏷 book_room
+# ===============================
 def handle_book_room(req):
+    if not _has_ctx(req, CTX_READY_TO_BOOK):
+        return jsonify({
+            "fulfillmentText": "We need to confirm date, time and number of people first. Which date would you like — today or tomorrow?",
+            "outputContexts": [
+                _ctx_obj(req, {}, CTX_CHECK_FLOW, lifespan=5)
+            ]
+        })
+
     parameters = req['queryResult'].get('parameters', {})
     student_id = parameters.get('student_id')
     room_category = parameters.get('roomCategory') or parameters.get('room_category')
@@ -284,9 +385,9 @@ def handle_book_room(req):
     date_param = parameters.get('date') or parameters.get('date-time')
     time_period = parameters.get('booking_time')
 
-    # 👀 从 context 补全遗漏参数
+    # 从 context 补全
     for context in req['queryResult'].get('outputContexts', []):
-        if 'booking_info' in context['name']:
+        if CTX_BOOKING in context['name']:
             ctx_params = context.get('parameters', {})
             student_id = student_id or ctx_params.get('student_id')
             room_category = room_category or ctx_params.get('roomCategory') or ctx_params.get('room_category')
@@ -294,11 +395,11 @@ def handle_book_room(req):
             date_param = date_param or ctx_params.get('date')
             time_period = time_period or ctx_params.get('booking_time')
 
-    # 🆔 学号格式校验
+    # 校验学号
     if not student_id or not str(student_id).isdigit() or len(str(student_id)) != 7:
-        return jsonify({"fulfillmentText": "⚠ Invalid student ID format. Must be 7-digit number."})
+        return jsonify({"fulfillmentText": "⚠ Invalid student ID. It must be a 7-digit number."})
 
-    # 📅 日期校验（只允许今天/明天）
+    # 校验日期
     date_obj = parse_date(date_param)
     if not date_obj:
         return jsonify({"fulfillmentText": RESPONSE['missing_date']})
@@ -308,34 +409,30 @@ def handle_book_room(req):
         return jsonify({"fulfillmentText": "⚠ You can only book for today or tomorrow."})
     date_str = date_obj.strftime("%d/%m/%Y")
 
-    # ⏰ 时间必填 + 校验
-    ok, msg, time_str = parse_and_validate_timeperiod(time_period)
+    # 校验时间
+    ok, msg, time_str, _, _ = parse_and_validate_timeperiod(time_period)
     if not ok:
         return jsonify({"fulfillmentText": msg})
 
-    # 👤 人数/房型联动（纯数字）
-    people = None
+    # 人数/房型联动
     try:
         people = int(room_size) if room_size is not None else None
     except Exception:
         return jsonify({"fulfillmentText": "⚠ Please provide a valid number of people."})
-
     if people == 1 and not room_category:
         room_category = 'solo'
     elif people is not None and people >= 2 and not room_category:
         room_category = 'discussion'
-
     if room_category == 'solo' and people is None:
         people = 1
 
-    # ✅ 检查是否已预约该日
+    # 检查是否已预约
     for row in get_all_bookings():
         if str(row.get('Student ID')) == str(student_id) and row.get('Date') == date_str:
             return jsonify({"fulfillmentText": RESPONSE['already_booked']})
 
-    # ✅ 输出确认 + 设置 context（附带 awaiting_confirmation，便于“no/yes”意图触发）
-    old = _get_ctx_params(req, 'booking_info')
-    merged = _merge_ctx_params(old, {
+    # 返回确认
+    merged = _merge_ctx_params(_get_ctx_params(req, CTX_BOOKING), {
         "student_id": student_id,
         "roomCategory": room_category,
         "roomSize": people,
@@ -345,18 +442,21 @@ def handle_book_room(req):
     return jsonify({
         "fulfillmentText": RESPONSE['confirm'].format(room_category, people, date_str, time_str),
         "outputContexts": [
-            _ctx_obj(req, merged, 'booking_info', lifespan=5),
-            {"name": f"{req['session']}/contexts/awaiting_confirmation", "lifespanCount": 5}
+            _ctx_obj(req, merged, CTX_BOOKING, lifespan=10),
+            {"name": f"{req['session']}/contexts/{CTX_AWAIT_CONFIRM}", "lifespanCount": 5}
         ]
     })
 
+# ===============================
+# ✅ ConfirmBooking
+# ===============================
 def handle_confirm_booking(req):
     def clean(val):
         return val[0] if isinstance(val, list) else val
 
     student_id = room_category = room_size = date_str = time_str = None
     for context in req['queryResult'].get('outputContexts', []):
-        if 'booking_info' in context['name']:
+        if CTX_BOOKING in context['name']:
             params = context.get('parameters', {})
             student_id = clean(params.get('student_id'))
             room_category = clean(params.get('roomCategory'))
@@ -366,22 +466,20 @@ def handle_confirm_booking(req):
             break
 
     if not student_id:
-        old = _get_ctx_params(req, 'booking_info')
         return jsonify({
-            "fulfillmentText": "Please enter your 7-digit student ID to complete the booking.",
+            "fulfillmentText": "Please enter your 7-digit student ID.",
             "outputContexts": [
-                _ctx_obj(req, old, 'booking_info', lifespan=5),
-                {"name": f"{req['session']}/contexts/awaiting_confirmation", "lifespanCount": 5}
+                _ctx_obj(req, _get_ctx_params(req, CTX_BOOKING), CTX_BOOKING, lifespan=5),
+                {"name": f"{req['session']}/contexts/{CTX_AWAIT_CONFIRM}", "lifespanCount": 5}
             ]
         })
 
     if not str(student_id).isdigit() or len(str(student_id)) != 7:
-        old = _get_ctx_params(req, 'booking_info')
         return jsonify({
-            "fulfillmentText": "⚠ Invalid student ID format. Must be 7-digit number.",
+            "fulfillmentText": "⚠ Invalid student ID. It must be a 7-digit number.",
             "outputContexts": [
-                _ctx_obj(req, old, 'booking_info', lifespan=5),
-                {"name": f"{req['session']}/contexts/awaiting_confirmation", "lifespanCount": 5}
+                _ctx_obj(req, _get_ctx_params(req, CTX_BOOKING), CTX_BOOKING, lifespan=5),
+                {"name": f"{req['session']}/contexts/{CTX_AWAIT_CONFIRM}", "lifespanCount": 5}
             ]
         })
 
@@ -390,10 +488,13 @@ def handle_confirm_booking(req):
         if ok:
             return jsonify({"fulfillmentText": RESPONSE['confirm_success']})
         else:
-            return jsonify({"fulfillmentText": "⚠ I couldn't save your booking to the sheet. Please try again later or contact staff."})
+            return jsonify({"fulfillmentText": "⚠ I couldn't save your booking. Please try again later or contact staff."})
     else:
         return jsonify({"fulfillmentText": RESPONSE['confirm_failed']})
 
+# ===============================
+# ❌ Cancel
+# ===============================
 def handle_cancel_booking(req):
     return jsonify({"fulfillmentText": RESPONSE['cancel']})
 
@@ -407,23 +508,21 @@ def handle_default(req):
     return jsonify({"fulfillmentText": RESPONSE['unknown']})
 
 # ===============================
-# 🧠 意图对应表
+# 🧠 Intent Map
 # ===============================
 INTENT_HANDLERS = {
-    # 欢迎 + 菜单
     'Welcome': handle_welcome,
     'Menu_CheckAvailability': handle_menu_check,
     'Menu_BookRoom': handle_menu_book,
     'Menu_CancelBooking': handle_menu_cancel,
     'Menu_LibraryInfo': handle_menu_info,
 
-    # 业务意图
     'CheckAvailability': handle_check_availability,
     'book_room': handle_book_room,
     'ConfirmBooking': handle_confirm_booking,
     'CancelBooking': handle_cancel_booking,
     'CancelAfterConfirmation': handle_cancel_after_confirmation,
-    'LibraryInfo': handle_library_info  # 如果 LibraryInfo 用静态响应，这行可以不加
+    'LibraryInfo': handle_library_info
 }
 
 # ===============================
@@ -437,7 +536,9 @@ def webhook():
     handler = INTENT_HANDLERS.get(intent, handle_default)
     return handler(req)
 
-# （可选）调试端点：快速验证是否能写入 Google Sheet
+# ===============================
+# 🧪 调试端点
+# ===============================
 @app.route('/debug/test-sheets', methods=['GET'])
 def debug_test_sheets():
     try:
@@ -449,8 +550,5 @@ def debug_test_sheets():
         logging.exception("❌ /debug/test-sheets failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# ===============================
-# ▶️ 本地启动
-# ===============================
 if __name__ == '__main__':
     app.run(port=5000, debug=True)
