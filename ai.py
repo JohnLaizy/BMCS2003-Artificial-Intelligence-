@@ -1,5 +1,5 @@
 # ===============================
-# 📦 导入模块
+# 📦 Imports
 # ===============================
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -8,25 +8,89 @@ from dateutil import parser
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import logging
+import json
 
 # ===============================
-# 📜 日志配置
+# 📜 Logging
 # ===============================
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # ===============================
-# 🚀 Flask 应用
+# 🧠 Session Store (local, in-memory)
+# ===============================
+session_store = {}
+
+
+def get_session_id(req) -> str:
+    """Extract Dialogflow session id (projects/.../sessions/<ID>)."""
+    return req.get('session', 'unknown_session')
+
+
+def update_session_store(session_id, new_params):
+    existing = session_store.get(session_id, {})
+    for k, v in (new_params or {}).items():
+        if v not in ["", None, []]:
+            existing[k] = v
+    session_store[session_id] = existing
+    logging.debug(f"🧠 Updated session_store[{session_id}]: {json.dumps(session_store[session_id], indent=2, default=str)}")
+
+
+def get_stored_params(session_id):
+    return session_store.get(session_id, {})
+
+
+# ===============================
+# 🧪 Debug log of context flow
+# ===============================
+def log_input_output_contexts(req):
+    session = req.get('session', 'unknown_session')
+    input_contexts = req.get('queryResult', {}).get('outputContexts', [])
+    logging.info(f"🔍 [Session: {session}] Input Contexts:")
+    for ctx in input_contexts:
+        logging.info(json.dumps(ctx, indent=2, default=str))
+
+
+def log_context_update(req, context_name, new_params):
+    session = req.get('session', 'unknown_session')
+    logging.debug(f"📦 Updating context: {context_name} in session {session}")
+    logging.debug(f"🔁 New parameters to merge into '{context_name}': {new_params}")
+    for ctx in req.get("queryResult", {}).get("outputContexts", []):
+        if context_name in ctx.get("name", ""):
+            logging.debug(f"📤 Existing parameters in '{context_name}': {ctx.get('parameters')}")
+            break
+
+
+def _log_input_contexts(req):
+    session = req.get("session", "")
+    contexts = req.get("queryResult", {}).get("outputContexts", [])
+    logging.info(f"🔍 [Session: {session}] Input Contexts:")
+    for ctx in contexts:
+        logging.info(json.dumps(ctx, indent=2, default=str))
+        
+def get_from_ctx(req, ctx_suffix, key): #helps getting data from context
+    for c in req.get("queryResult", {}).get("outputContexts", []):
+        name = c.get("name", "").lower()
+        if name.endswith(f"/{ctx_suffix.lower()}"):
+            v = (c.get("parameters") or {}).get(key)
+            if v not in ("", None, []):
+                return v
+    return None
+
+
+
+# ===============================
+# 🚀 Flask
 # ===============================
 app = Flask(__name__)
 CORS(app)
 
 # ===============================
-# ⏰ 开放时间（考试期间可设置到 24:00）
+# ⏰ Opening hours
 # ===============================
 ALLOW_UNTIL_MIDNIGHT = False
 
 # ===============================
-# 📊 Google Sheets 连接
+# 📊 Google Sheets
 # ===============================
 scope = [
     'https://www.googleapis.com/auth/spreadsheets',
@@ -38,7 +102,10 @@ client = gspread.authorize(creds)
 SHEET_TITLE = 'library-bot-sheet'
 REQUIRED_HEADERS = ["Student ID", "Category", "Size", "Date", "Time"]
 
-# 确保表头存在
+# Check if the room is ready to book
+def _is_ready_to_book(state: dict) -> bool:
+    return bool(state.get("date") and state.get("booking_time") and state.get("room_size"))
+
 def _ensure_headers(ws):
     try:
         first_row = ws.row_values(1)
@@ -49,6 +116,7 @@ def _ensure_headers(ws):
     except Exception:
         logging.exception("❌ Failed to ensure headers on sheet")
 
+
 try:
     sheet = client.open(SHEET_TITLE).sheet1
     _ensure_headers(sheet)
@@ -57,9 +125,10 @@ except Exception:
     logging.exception("❌ Failed to open Google Sheet. Check title/share/permissions.")
     raise
 
-# 工具函数：读取和写入 Google Sheets
+
 def get_all_bookings():
     return sheet.get_all_records()
+
 
 def append_booking(student_id, category, size, date_str, time_str):
     try:
@@ -71,21 +140,25 @@ def append_booking(student_id, category, size, date_str, time_str):
         logging.exception("❌ append_booking failed")
         return False
 
-# ===============================
-# 🧱 上下文名称定义
-# ===============================
-CTX_MENU = "awaiting_menu"            
-CTX_BOOKING = "booking_info"          
-CTX_CHECK_FLOW = "check_flow"         
-CTX_READY_TO_BOOK = "ready_to_book"   
-CTX_AWAIT_CONFIRM = "awaiting_confirmation"  
 
-# 工具函数：获取、合并、构建 context
+# ===============================
+# 🧱 Context names
+# ===============================
+CTX_MENU = "awaiting_menu"
+CTX_BOOKING = "booking_info"
+CTX_CHECK_FLOW = "check_flow"
+CTX_READY_TO_BOOK = "ready_to_book"
+CTX_AWAIT_CONFIRM = "awaiting_confirmation"
+
+
 def _get_ctx_params(req, ctx_name=CTX_BOOKING):
     for c in req['queryResult'].get('outputContexts', []):
         if ctx_name in c.get('name', ''):
+            logging.info(f"🔍 Found context '{ctx_name}': {json.dumps(c.get('parameters', {}), indent=2, default=str)}")
             return c.get('parameters', {}) or {}
+    logging.info(f"⚠ Context '{ctx_name}' not found in request")
     return {}
+
 
 def _has_ctx(req, ctx_name):
     for c in req['queryResult'].get('outputContexts', []):
@@ -93,12 +166,125 @@ def _has_ctx(req, ctx_name):
             return True
     return False
 
-def _merge_ctx_params(old_params: dict, new_params: dict) -> dict:
-    merged = dict(old_params or {})
-    for k, v in (new_params or {}).items():
-        if v not in (None, "", []):
-            merged[k] = v
+def get_param(req, name, ctx_name="booking_info"):
+    # 1) This turn (slot-filled)
+    val = req.get("queryResult", {}).get("parameters", {}).get(name)
+    if val not in ("", None, []):
+        return val
+    # 2) From context (previous turns)
+    for c in req.get("queryResult", {}).get("outputContexts", []):
+        if ctx_name in c.get("name", ""):
+            v = c.get("parameters", {}).get(name)
+            if v not in ("", None, []):
+                return v
+    return None
+
+def _resolve_date(req):
+    # explicit typed date (from @re_date)
+    explicit = get_param(req, "explicit_date")
+    if explicit not in ("", None, []):
+        return explicit
+    # selector (today/tomorrow)
+    sel = get_param(req, "date")
+    if sel in ("today", "tomorrow"):  # from @date_selector
+        return sel
+    # legacy fallback
+    return sel
+
+# ===============================
+# 👣 Step-aware getters (current turn → step context → booking_info)
+# ===============================
+
+def get_from_ctx(req, ctx_suffix, key): #helps getting data from context
+    for c in req.get("queryResult", {}).get("outputContexts", []):
+        name = c.get("name", "").lower()
+        if name.endswith(f"/{ctx_suffix.lower()}"):
+            v = (c.get("parameters") or {}).get(key)
+            if v not in ("", None, []):
+                return v
+    return None
+
+def get_param_from_steps(req, key, step_ctx_suffix, booking_ctx="booking_info"): # sets the priority in which the context is checked
+    # 1) current turn slot
+    v = req.get("queryResult", {}).get("parameters", {}).get(key)
+    if v not in ("", None, []):
+        return v
+    # 2) this step's specific context (e.g., checkavailability_time)
+    v = get_from_ctx(req, step_ctx_suffix, key)
+    if v not in ("", None, []):
+        return v
+    # 3) fallback → consolidated sticky context
+    return get_param(req, key, ctx_name=booking_ctx)
+
+def collect_by_steps(req):
+    return {
+        # Date comes from checkDate step → output context: prompt_time
+        "date":          get_param_from_steps(req, "date",          "prompt_time"),
+        "explicit_date": get_param_from_steps(req, "explicit_date", "prompt_time"),
+
+        # Time comes from ProvideTime step → output context: prompt_size
+        "booking_time":  get_param_from_steps(req, "booking_time",  "prompt_size"),
+
+        # Room size comes from ProvideRoomSize step → output context: prompt_category
+        "room_size":     get_param_from_steps(req, "room_size",     "prompt_category"),
+
+        # Category comes from ChooseCategory step → output context: awaiting_confirmation
+        "room_category": get_param_from_steps(req, "room_category", "awaiting_confirmation"),
+
+        # Student ID is also asked at confirmation time
+        "student_id":    get_param_from_steps(req, "student_id",    "awaiting_confirmation"),
+    }
+
+
+
+
+
+
+# ===============================
+# 🔤 Schema normalization (camel→snake) + safe merge
+# ===============================
+SNAKE_KEYS = {
+    "student_id": "student_id",
+    "room_category": "room_category",
+    "room_size": "room_size",
+    "date": "date",
+    "booking_time": "booking_time",
+    "time": "time",
+}
+
+CAMEL_TO_SNAKE = {
+    "roomCategory": "room_category",
+    "roomSize": "room_size",
+    "StudentID": "student_id",
+    "studentId": "student_id",
+    "RoomCategory": "room_category",
+    "RoomSize": "room_size",
+    "TimePeriod": "booking_time",
+    "Date": "date",
+}
+
+ALLOWED_KEYS = set(SNAKE_KEYS.values())  # allowed schema keys
+
+
+def _to_snake_params(p: dict) -> dict:
+    out = {}
+    for k, v in (p or {}).items():
+        if v in ("", None, []):
+            continue
+        k_snake = CAMEL_TO_SNAKE.get(k, k)
+        if k_snake in ALLOWED_KEYS:
+            out[k_snake] = v
+    return out
+
+
+def _merge_ctx_params(existing: dict, new_params: dict) -> dict:
+    ex = _to_snake_params(existing or {})
+    nw = _to_snake_params(new_params or {})
+    merged = {**ex, **nw}
+    for k in ALLOWED_KEYS:
+        merged.setdefault(k, "")
     return merged
+
 
 def _ctx_obj(req, params: dict, ctx_name=CTX_BOOKING, lifespan=5):
     return {
@@ -107,8 +293,109 @@ def _ctx_obj(req, params: dict, ctx_name=CTX_BOOKING, lifespan=5):
         "parameters": params
     }
 
+# NEW: combine session buffer + existing context as the base state
+# session buffer takes precedence over prior context
+# 会话缓冲优先于先前的上下文
+
+def _get_buffered_params(req) -> dict:
+    ctx = _get_ctx_params(req, CTX_BOOKING)
+    ssn = get_stored_params(get_session_id(req))
+    return _merge_ctx_params(ctx, ssn)
+
+def _buffer_to_event_params(req):
+    st = collect_by_steps(req)
+    return {k: v for k, v in st.items() if v not in ("", None, [])}
+
+# Example:
+    return jsonify({
+        "fulfillmentText": "...",
+        "outputContexts": _sticky_outcontexts(req, state),
+        "followupEventInput": {
+            "name": "EVT_BOOK_READY",
+            "languageCode": "en",
+            "parameters": _buffer_to_event_params(req)
+        }
+    })
+
+
+
 # ===============================
-# 🤖 回复文本（英文）
+# ✨ Normalizer + Sticky Contexts
+# ===============================
+
+def _norm_params(p: dict) -> dict:
+    p = p or {}
+    def pick(*names):
+        for n in names:
+            if n in p and p[n] not in (None, "", []):
+                return p[n]
+        return None
+    return {
+        "student_id":   pick("student_id", "StudentID", "studentId"),
+        "roomCategory": pick("roomCategory", "room_category", "RoomCategory"),
+        "roomSize":     pick("roomSize", "room_size", "RoomSize"),
+        "date":         pick("date", "date-time", "date_time", "Date"),
+        "booking_time": pick("booking_time", "time_period", "TimePeriod"),
+    }
+
+
+STICKY_LIFESPAN = 50
+
+
+def _sticky_outcontexts(req, booking_params=None, extra_ctx=None, keep_menu=False):
+    """Generate outputContexts based on the **session buffer as source of truth**,
+    merge with incoming booking_params, then persist to both Dialogflow and session_store.
+    基于会话缓冲作为真值来源，合并新参数，再同时写回 Dialogflow 上下文与本地缓存。
+    """
+    log_context_update(req, CTX_BOOKING, booking_params or {})
+    session_id = get_session_id(req)
+    out = []
+
+    # 1) start from buffered params (session buffer > existing context)
+    base = _get_buffered_params(req)
+
+    # 2) merge new incoming params
+    merged = _merge_ctx_params(base, booking_params or {})
+    logging.info(f"📌 (buffer-first) Merged params for context: {json.dumps(merged, indent=2, default=str)}")
+
+    # 3) write to Dialogflow contexts
+    out.append(_ctx_obj(req, merged, CTX_BOOKING, lifespan=STICKY_LIFESPAN))
+
+    # 4) mirror to local session store (becomes the new buffer)
+    update_session_store(session_id, merged)
+
+    # 5) any extra contexts
+    for item in (extra_ctx or []):
+        if isinstance(item, tuple) and len(item) == 2:
+            nm, life = item
+            out.append({"name": f"{req['session']}/contexts/{nm}", "lifespanCount": life})
+        elif isinstance(item, str):
+            out.append({"name": f"{req['session']}/contexts/{item}", "lifespanCount": STICKY_LIFESPAN})
+
+    if not keep_menu:
+        out.append({"name": f"{req['session']}/contexts/{CTX_MENU}", "lifespanCount": 0})
+
+    logging.info("📤 OutputContexts generated (buffer-first):")
+    for ctx in out:
+        logging.info(json.dumps(ctx, indent=2, default=str))
+    return out
+
+
+def _reset_all_to_menu(req):
+    # Clear server-side memory too
+    session_id = get_session_id(req)
+    session_store.pop(session_id, None)
+    return [
+        {"name": f"{req['session']}/contexts/{CTX_BOOKING}", "lifespanCount": 0},
+        {"name": f"{req['session']}/contexts/{CTX_CHECK_FLOW}", "lifespanCount": 0},
+        {"name": f"{req['session']}/contexts/{CTX_READY_TO_BOOK}", "lifespanCount": 0},
+        {"name": f"{req['session']}/contexts/{CTX_AWAIT_CONFIRM}", "lifespanCount": 0},
+        {"name": f"{req['session']}/contexts/{CTX_MENU}", "lifespanCount": 5},
+    ]
+
+
+# ===============================
+# 🤖 Responses
 # ===============================
 RESPONSE = {
     "welcome": (
@@ -133,354 +420,287 @@ RESPONSE = {
     "confirm_success": "✅ Your booking has been saved successfully.",
     "confirm_failed": "⚠ Booking failed. Missing information.",
     "cancel": "🖑 Your booking has been cancelled.",
-    "unknown": "Sorry, I didn’t understand that.",
+    "unknown": "Sorry, I didn't understand that.",
     "cancel_confirm": "Got it. The booking has been cancelled.",
-    "library_info": "Library hours: 8:00 AM – 10:00 PM daily. Solo rooms fit 1 person; discussion rooms fit 2–6 people."
+    "library_info": "Library hours: 8:00 AM - 10:00 PM daily. Solo rooms fit 1 person; discussion rooms fit 2-6 people."
 }
 
+
 # ===============================
-# 🗓 日期解析
+# 🗓 Date parsing (robust)
 # ===============================
+
 def parse_date(date_param):
     if not date_param:
         return None
     try:
-        if isinstance(date_param, dict) and 'date_time' in date_param:
-            dt = parser.isoparse(date_param['date_time'])
-            return dt.date()
-        elif isinstance(date_param, str):
-            s = date_param.strip().lower()
-            if s == 'today':
+        if isinstance(date_param, dict):
+            for k in ("date_time", "startDate", "start_date", "start"):
+                if k in date_param and date_param[k]:
+                    return parser.isoparse(date_param[k]).date()
+            if "date" in date_param and date_param["date"]:
+                try:
+                    return parser.isoparse(date_param["date"]).date()
+                except Exception:
+                    pass
+                for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%Y-%m-%d"):
+                    try:
+                        return datetime.strptime(date_param["date"], fmt).date()
+                    except Exception:
+                        continue
+            return None
+        if isinstance(date_param, str):
+            s = date_param.strip()
+            sl = s.lower()
+            if sl == "today":
                 return date.today()
-            elif s == 'tomorrow':
+            if sl == "tomorrow":
                 return date.today() + timedelta(days=1)
-            else:
-                dt = parser.isoparse(date_param)
-                return dt.date()
+            try:
+                return parser.isoparse(s).date()
+            except Exception:
+                pass
+            for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y/%m/%d", "%Y-%m-%d"):
+                try:
+                    return datetime.strptime(s, fmt).date()
+                except Exception:
+                    continue
+        return None
     except Exception:
         logging.exception("Date parsing error")
         return None
 
+
 # ===============================
-# ⏱ 时间段解析与校验
+# ⏱ Time period parsing
 # ===============================
+
 def parse_and_validate_timeperiod(time_period):
-    """
-    返回: (ok: bool, msg: str|None, time_str: str|None, start_obj, end_obj)
-      - 必须在同一天
-      - 8:00 ≤ start < end ≤ 22:00（考试期 ≤ 24:00）
-      - 时长 ≤ 3 小时
-    """
     if not time_period or not isinstance(time_period, dict):
         return False, RESPONSE['missing_time'], None, None, None
-
     start_time = time_period.get('startTime')
     end_time = time_period.get('endTime')
     if not start_time or not end_time:
         return False, RESPONSE['missing_time'], None, None, None
-
     try:
         start_obj = parser.isoparse(start_time)
         end_obj = parser.isoparse(end_time)
-
-        if start_obj.date() != end_obj.date():
+        same_day = (start_obj.date() == end_obj.date())
+        allows_2400 = (
+            ALLOW_UNTIL_MIDNIGHT and
+            end_obj == start_obj.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        )
+        if not same_day and not allows_2400:
             return False, RESPONSE['invalid_time'], None, None, None
-
-        opening = dtime(8, 0, 0)
-        closing_hour = 24 if ALLOW_UNTIL_MIDNIGHT else 22
-        closing = dtime(closing_hour % 24, 0, 0)
-
-        if not (opening <= start_obj.time() < end_obj.time() <= closing):
+        opening_dt = start_obj.replace(hour=8, minute=0, second=0, microsecond=0)
+        if ALLOW_UNTIL_MIDNIGHT:
+            closing_dt = start_obj.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        else:
+            closing_dt = start_obj.replace(hour=22, minute=0, second=0, microsecond=0)
+        if not (opening_dt <= start_obj < end_obj <= closing_dt):
             return False, RESPONSE['outside_hours'], None, None, None
-
         duration_hours = (end_obj - start_obj).total_seconds() / 3600.0
         if duration_hours - 3.0 > 1e-6:
             return False, RESPONSE['too_long'], None, None, None
-
         time_str = f"{start_obj.strftime('%I:%M %p')} to {end_obj.strftime('%I:%M %p')}"
         return True, None, time_str, start_obj, end_obj
-
     except Exception:
         logging.exception("Time parsing failed")
         return False, RESPONSE['invalid_time'], None, None, None
 
+
 # ===============================
-# 🤖 Welcome + Menu
+# 🤖 Intent Handlers
 # ===============================
+
 def handle_welcome(req):
-    # 多行菜单回复
     lines = [ln for ln in RESPONSE['welcome'].split("\n") if ln.strip()]
     return jsonify({
         "fulfillmentMessages": [{"text": {"text": [ln]}} for ln in lines],
-        "outputContexts": [
-            {"name": f"{req['session']}/contexts/{CTX_MENU}", "lifespanCount": 5}
-        ]
+        "outputContexts": _reset_all_to_menu(req)
     })
 
-def _menu_followup(req, event_name: str, text: str):
-    return jsonify({
-        "fulfillmentText": text,
-        "followupEventInput": {
-            "name": event_name,
-            "languageCode": "en",
-            "parameters": _get_ctx_params(req, CTX_BOOKING)
-        }
-    })
 
 def handle_menu_check(req):
-    fresh = {"booking_time": None}
+    # Clear any stale booking_time on entering check flow; persist locally too
+    session_id = get_session_id(req)
+    update_session_store(session_id, {"booking_time": ""})
     return jsonify({
         "fulfillmentText": "Entering availability check. Which date would you like to check — today or tomorrow?",
-        "outputContexts": [
-            _ctx_obj(req, fresh, CTX_BOOKING, lifespan=5),
-            _ctx_obj(req, {}, CTX_CHECK_FLOW, lifespan=5),
-            {"name": f"{req['session']}/contexts/{CTX_MENU}", "lifespanCount": 0},
-            {"name": f"{req['session']}/contexts/{CTX_READY_TO_BOOK}", "lifespanCount": 0}
-        ],
+        "outputContexts": _sticky_outcontexts(req, booking_params={"booking_time": None}),
         "followupEventInput": {"name": "EVT_CHECK", "languageCode": "en"}
     })
+
 
 def handle_menu_book(req):
     if not _has_ctx(req, CTX_READY_TO_BOOK):
         return jsonify({
             "fulfillmentText": "Let's check availability first. Which date would you like — today or tomorrow?",
-            "outputContexts": [
-                _ctx_obj(req, {}, CTX_CHECK_FLOW, lifespan=5)
-            ]
+            "outputContexts": _sticky_outcontexts(req)
         })
-    return _menu_followup(req, "EVT_BOOK", "Proceeding to booking. Please enter your 7-digit student ID.")
+    return jsonify({
+        "fulfillmentText": "Proceeding to booking. Please enter your 7-digit student ID.",
+        "followupEventInput": {"name": "EVT_BOOK", "languageCode": "en"}
+    })
+
 
 def handle_menu_cancel(req):
-    return _menu_followup(req, "EVT_CANCEL", "Okay, let's cancel a booking. Please provide your 7-digit student ID and the date.")
+    return jsonify({
+        "fulfillmentText": "Okay, let's cancel a booking. Please provide your 7-digit student ID and the date.",
+        "followupEventInput": {"name": "EVT_CANCEL", "languageCode": "en"}
+    })
+
 
 def handle_menu_info(req):
     return jsonify({"fulfillmentText": RESPONSE["library_info"]})
 
-# ===============================
-# 🔎 CheckAvailability（检查可用性）
-# ===============================
+
 def handle_check_availability(req):
-    # 确保进入查询流程上下文
-    if not _has_ctx(req, CTX_CHECK_FLOW):
+    state = collect_by_steps(req)
+    # Expecting the date at this step
+    if not state.get("date") and not state.get("explicit_date"):
         return jsonify({
-            "fulfillmentText": "We'll check availability now. Which date would you like — today or tomorrow?",
-            "outputContexts": [
-                _ctx_obj(req, {}, CTX_CHECK_FLOW, lifespan=5)
-            ]
+            "fulfillmentText": "📅 Which date would you like to check — today or tomorrow?",
+            "outputContexts": _sticky_outcontexts(req, state)
         })
-
-    parameters = req['queryResult'].get('parameters', {})
-    room_category = parameters.get('room_category')
-    room_size = parameters.get('room_size')
-    date_param = parameters.get('date') or parameters.get('date-time')
-    time_period = parameters.get('booking_time')
-
-    # ===============================
-    # 🕒 ❶ 判断用户是否明确输入了时间（没有就丢弃旧的）
-    # ===============================
-    user_text = (req['queryResult'].get('queryText') or '').lower()
-    has_time_words = any(w in user_text for w in [' to ', '-', 'from', 'until', 'pm', 'am', ':'])
-    if not has_time_words:
-        time_period = None
-
-    # ===============================
-    # 🕒 ❷ 校验时间（如果输入了时间，先验证是否合法）
-    # ===============================
-    if time_period:
-        ok, msg, _, _, _ = parse_and_validate_timeperiod(time_period)
-        if not ok:
-            old = _get_ctx_params(req, CTX_BOOKING)
-            merged = _merge_ctx_params(old, {
-                "roomCategory": room_category,
-                "roomSize": room_size,
-                "date": old.get("date"),   # ⚠ 保留已有日期
-                "booking_time": None       # ❌ 清掉错误时间
-            })
-            return jsonify({
-                "fulfillmentText": f"{msg} Please enter a new time period within opening hours, max 3 hours (e.g. 2 PM to 5 PM).",
-                "outputContexts": [
-                    _ctx_obj(req, merged, CTX_BOOKING, lifespan=5),
-                    _ctx_obj(req, {}, CTX_CHECK_FLOW, lifespan=5)
-                ]
-            })
-
-    # ===============================
-    # 📅 ❸ 校验日期（新增逻辑：优先复用 context 里的日期）
-    # ===============================
-    old = _get_ctx_params(req, CTX_BOOKING)
-    date_obj = parse_date(date_param)
-
-    if not date_obj and old.get("date"):
-        # ✅ 如果 context 里已经存了日期，就直接复用，不要再问
-        date_obj = parse_date(old.get("date"))
-
-    if not date_obj:
-        # ❌ 如果用户和 context 都没有日期 → 必须追问
-        merged = _merge_ctx_params(old, {
-            "roomCategory": room_category,
-            "roomSize": room_size,
-            "booking_time": time_period   # ⚠ 保留已通过校验的时间，避免重复输入
-        })
-        return jsonify({
-            "fulfillmentText": RESPONSE['missing_date_checkAvailability'],
-            "outputContexts": [
-                _ctx_obj(req, merged, CTX_BOOKING, lifespan=5),
-                _ctx_obj(req, {}, CTX_CHECK_FLOW, lifespan=5)
-            ]
-        })
-
-    date_str = date_obj.strftime("%d/%m/%Y")
-
-    # ===============================
-    # 👥 ❹ 人数缺失 → 追问
-    # ===============================
-    if not room_size:
-        merged = _merge_ctx_params(old, {
-            "roomCategory": room_category,
-            "date": date_str,
-            "booking_time": time_period
-        })
-        return jsonify({
-            "fulfillmentText": RESPONSE['missing_people'],
-            "outputContexts": [
-                _ctx_obj(req, merged, CTX_BOOKING, lifespan=5),
-                _ctx_obj(req, {}, CTX_CHECK_FLOW, lifespan=5)
-            ]
-        })
-
-    # ===============================
-    # ✅ ❺ 信息齐全 → 下发 ready_to_book
-    # ===============================
-    ok, msg, time_str, _, _ = parse_and_validate_timeperiod(time_period)
-    merged = _merge_ctx_params(old, {
-        "roomCategory": room_category,
-        "roomSize": room_size,
-        "date": date_str,
-        "booking_time": time_period
-    })
+    # Keep asking next step
     return jsonify({
-        "fulfillmentText": f"Great. I have a {room_category} room for {room_size} people on {date_str} from {time_str}. Say 'Book' to proceed.",
-        "outputContexts": [
-            _ctx_obj(req, merged, CTX_BOOKING, lifespan=10),
-            _ctx_obj(req, {}, CTX_READY_TO_BOOK, lifespan=3)
-        ]
+        "fulfillmentText": "Got it. What time would you like? (e.g., 2 PM to 5 PM)",
+        "outputContexts": _sticky_outcontexts(req, state)
     })
 
-# ===============================
-# 🏷 book_room
-# ===============================
-def handle_book_room(req):
-    if not _has_ctx(req, CTX_READY_TO_BOOK):
+def handle_provide_time(req):
+    state = collect_by_steps(req)
+
+    if not state.get("booking_time"):
         return jsonify({
-            "fulfillmentText": "We need to confirm date, time and number of people first. Which date would you like — today or tomorrow?",
-            "outputContexts": [
-                _ctx_obj(req, {}, CTX_CHECK_FLOW, lifespan=5)
-            ]
+            "fulfillmentText": "🕒 What time would you like? e.g., 2 PM to 5 PM.",
+            "outputContexts": _sticky_outcontexts(req, state)
         })
 
-    parameters = req['queryResult'].get('parameters', {})
-    student_id = parameters.get('student_id')
-    room_category = parameters.get('roomCategory') or parameters.get('room_category')
-    room_size = parameters.get('roomSize') or parameters.get('room_size')
-    date_param = parameters.get('date') or parameters.get('date-time')
-    time_period = parameters.get('booking_time')
-
-    # 从 context 补全
-    for context in req['queryResult'].get('outputContexts', []):
-        if CTX_BOOKING in context['name']:
-            ctx_params = context.get('parameters', {})
-            student_id = student_id or ctx_params.get('student_id')
-            room_category = room_category or ctx_params.get('roomCategory') or ctx_params.get('room_category')
-            room_size = room_size or ctx_params.get('roomSize') or ctx_params.get('room_size')
-            date_param = date_param or ctx_params.get('date')
-            time_period = time_period or ctx_params.get('booking_time')
-
-    # 校验学号
-    if not student_id or not str(student_id).isdigit() or len(str(student_id)) != 7:
-        return jsonify({"fulfillmentText": "⚠ Invalid student ID. It must be a 7-digit number."})
-
-    # 校验日期
-    date_obj = parse_date(date_param)
-    if not date_obj:
-        return jsonify({"fulfillmentText": RESPONSE['missing_date']})
-    today = date.today()
-    tomorrow = today + timedelta(days=1)
-    if date_obj not in (today, tomorrow):
-        return jsonify({"fulfillmentText": "⚠ You can only book for today or tomorrow."})
-    date_str = date_obj.strftime("%d/%m/%Y")
-
-    # 校验时间
-    ok, msg, time_str, _, _ = parse_and_validate_timeperiod(time_period)
+    ok, msg, time_str, _, _ = parse_and_validate_timeperiod(state["booking_time"])
     if not ok:
-        return jsonify({"fulfillmentText": msg})
+        return jsonify({
+            "fulfillmentText": msg,
+            "outputContexts": _sticky_outcontexts(req, state)
+        })
 
-    # 人数/房型联动
-    try:
-        people = int(room_size) if room_size is not None else None
-    except Exception:
-        return jsonify({"fulfillmentText": "⚠ Please provide a valid number of people."})
-    if people == 1 and not room_category:
-        room_category = 'solo'
-    elif people is not None and people >= 2 and not room_category:
-        room_category = 'discussion'
-    if room_category == 'solo' and people is None:
-        people = 1
+    state["time"] = time_str
 
-    # 检查是否已预约
-    for row in get_all_bookings():
-        if str(row.get('Student ID')) == str(student_id) and row.get('Date') == date_str:
-            return jsonify({"fulfillmentText": RESPONSE['already_booked']})
+    # If time completes the required set, jump to booking
+    if _is_ready_to_book(state):
+        return jsonify({
+            "fulfillmentText": "Great—checking rooms...",
+            "outputContexts": _sticky_outcontexts(req, state),
+            "followupEventInput": {"name": "EVT_BOOK", "languageCode": "en"}
+        })
 
-    # 返回确认
-    merged = _merge_ctx_params(_get_ctx_params(req, CTX_BOOKING), {
-        "student_id": student_id,
-        "roomCategory": room_category,
-        "roomSize": people,
-        "date": date_str,
-        "time": time_str
-    })
+    # Otherwise ask next slot
     return jsonify({
-        "fulfillmentText": RESPONSE['confirm'].format(room_category, people, date_str, time_str),
-        "outputContexts": [
-            _ctx_obj(req, merged, CTX_BOOKING, lifespan=10),
-            {"name": f"{req['session']}/contexts/{CTX_AWAIT_CONFIRM}", "lifespanCount": 5}
-        ]
+        "fulfillmentText": "👥 How many people will be using the room?",
+        "outputContexts": _sticky_outcontexts(req, state, extra_ctx=[("prompt_category", 5)])
     })
 
-# ===============================
-# ✅ ConfirmBooking
-# ===============================
+
+def handle_provide_size(req):
+    # Read values the same way as date/time handlers
+    state = collect_by_steps(req)
+
+    # Expect Dialogflow to have filled 'room_size' (either a number or your @room_size bucket)
+    size_val = state.get("room_size")
+    if size_val in ("", None, []):
+        return jsonify({
+            "fulfillmentText": "👥 How many people will use the room? (e.g., 3)",
+            "outputContexts": _sticky_outcontexts(req, state)
+        })
+
+    # Just persist what DF gave us; do NOT infer category here
+    # (_sticky_outcontexts writes to booking_info + session_store)
+    return jsonify({
+        "fulfillmentText": "🏷️ Please choose a room category: SOLO or DISCUSSION.",
+        # Nudge the next step's context so ChooseCategory can match easily
+        "outputContexts": _sticky_outcontexts(req, state, extra_ctx=[("prompt_category", 5)])
+    })
+
+
+def handle_choose_category(req):
+    state = collect_by_steps(req)
+
+    cat = (state.get("room_category") or "").strip().lower()
+    if cat not in ("solo", "discussion"):
+        return jsonify({
+            "fulfillmentText": "🏷️ Please choose: SOLO or DISCUSSION.",
+            "outputContexts": _sticky_outcontexts(req, state)
+        })
+
+    # Category set—if all required present, jump to booking
+    if _is_ready_to_book(state):
+        return jsonify({
+            "fulfillmentText": "Great—checking rooms...",
+            "outputContexts": _sticky_outcontexts(req, state),
+            "followupEventInput": {"name": "EVT_BOOK", "languageCode": "en"}
+        })
+
+    # Otherwise ask next info (shouldn’t happen if earlier steps done)
+    return jsonify({
+        "fulfillmentText": "Please provide your 7-digit student ID.",
+        "outputContexts": _sticky_outcontexts(req, state, extra_ctx=[("awaiting_confirmation", 5)])
+    })
+
+
+
+def handle_book_room(req):
+    state = collect_by_steps(req)
+
+    # validate date & time
+    date_obj = parse_date(state.get("date"))
+    ok, msg, time_str, _, _ = parse_and_validate_timeperiod(state.get("booking_time"))
+    if not date_obj:
+        return jsonify({"fulfillmentText": "⚠ Please provide a valid date (today/tomorrow).",
+                        "outputContexts": _sticky_outcontexts(req, state)})
+    if not ok:
+        return jsonify({"fulfillmentText": msg,
+                        "outputContexts": _sticky_outcontexts(req, state)})
+
+    # pretty time string (keep)
+    if not state.get("time"):
+        state["time"] = time_str
+
+    # DO NOT coerce room_size; keep Dialogflow's value (e.g., "Small" or "3")
+    size_text = state.get("room_size")
+
+    # DO NOT auto-infer category here; just keep what user chose earlier
+    cat = (state.get("room_category") or "").strip().lower()
+
+    # normalize date for sheet
+    state["date"] = date_obj.strftime("%d/%m/%Y")
+
+    # write back unchanged values
+    state["room_size"] = size_text
+    state["room_category"] = cat
+
+    return jsonify({
+        "fulfillmentText": f"Let me confirm: a {size_text} {cat} room on {state['date']} from {state['time']}. Say 'Yes' to confirm or 'No' to cancel.",
+        "outputContexts": _sticky_outcontexts(req, state, extra_ctx=[("awaiting_confirmation", 5)])
+    })
+
 def handle_confirm_booking(req):
-    def clean(val):
-        return val[0] if isinstance(val, list) else val
+    params = _get_ctx_params(req, CTX_BOOKING)
 
-    student_id = room_category = room_size = date_str = time_str = None
-    for context in req['queryResult'].get('outputContexts', []):
-        if CTX_BOOKING in context['name']:
-            params = context.get('parameters', {})
-            student_id = clean(params.get('student_id'))
-            room_category = clean(params.get('roomCategory'))
-            room_size = clean(params.get('roomSize'))
-            date_str = clean(params.get('date'))
-            time_str = clean(params.get('time'))
-            break
+    # also backfill from local session store if needed
+    if not params:
+        params = get_stored_params(get_session_id(req))
 
-    if not student_id:
+    student_id = params.get('student_id')
+    room_category = params.get('room_category')
+    room_size = params.get('room_size')
+    date_str = params.get('date')
+    time_str = params.get('time')
+
+    if not student_id or not str(student_id).isdigit() or len(str(student_id)) != 7:
         return jsonify({
             "fulfillmentText": "Please enter your 7-digit student ID.",
-            "outputContexts": [
-                _ctx_obj(req, _get_ctx_params(req, CTX_BOOKING), CTX_BOOKING, lifespan=5),
-                {"name": f"{req['session']}/contexts/{CTX_AWAIT_CONFIRM}", "lifespanCount": 5}
-            ]
-        })
-
-    if not str(student_id).isdigit() or len(str(student_id)) != 7:
-        return jsonify({
-            "fulfillmentText": "⚠ Invalid student ID. It must be a 7-digit number.",
-            "outputContexts": [
-                _ctx_obj(req, _get_ctx_params(req, CTX_BOOKING), CTX_BOOKING, lifespan=5),
-                {"name": f"{req['session']}/contexts/{CTX_AWAIT_CONFIRM}", "lifespanCount": 5}
-            ]
+            "outputContexts": _sticky_outcontexts(req, booking_params=params, extra_ctx=[(CTX_AWAIT_CONFIRM, 5)])
         })
 
     if all([student_id, room_category, room_size, date_str, time_str]):
@@ -492,20 +712,23 @@ def handle_confirm_booking(req):
     else:
         return jsonify({"fulfillmentText": RESPONSE['confirm_failed']})
 
-# ===============================
-# ❌ Cancel
-# ===============================
+
 def handle_cancel_booking(req):
-    return jsonify({"fulfillmentText": RESPONSE['cancel']})
+    # (Optional) you could remove a row from Sheet by student+date; for now just respond
+    return jsonify({"fulfillmentText": RESPONSE['cancel'], "outputContexts": _sticky_outcontexts(req)})
+
 
 def handle_cancel_after_confirmation(req):
-    return jsonify({"fulfillmentText": RESPONSE['cancel_confirm']})
+    return jsonify({"fulfillmentText": RESPONSE['cancel_confirm'], "outputContexts": _sticky_outcontexts(req)})
+
 
 def handle_library_info(req):
-    return jsonify({"fulfillmentText": RESPONSE["library_info"]})
+    return jsonify({"fulfillmentText": RESPONSE["library_info"], "outputContexts": _sticky_outcontexts(req)})
+
 
 def handle_default(req):
     return jsonify({"fulfillmentText": RESPONSE['unknown']})
+
 
 # ===============================
 # 🧠 Intent Map
@@ -516,8 +739,14 @@ INTENT_HANDLERS = {
     'Menu_BookRoom': handle_menu_book,
     'Menu_CancelBooking': handle_menu_cancel,
     'Menu_LibraryInfo': handle_menu_info,
-
-    'CheckAvailability': handle_check_availability,
+    
+    #Check Flow
+    'CheckAvailability_Date': handle_check_availability,
+    'ProvideRoomSize': handle_provide_size,
+    'ProvideTime': handle_provide_time,
+    'ChooseCategory': handle_choose_category,
+    
+    #Book
     'book_room': handle_book_room,
     'ConfirmBooking': handle_confirm_booking,
     'CancelBooking': handle_cancel_booking,
@@ -525,19 +754,24 @@ INTENT_HANDLERS = {
     'LibraryInfo': handle_library_info
 }
 
+
 # ===============================
-# 🌐 Webhook 入口
+# 🌐 Webhook entry
 # ===============================
 @app.route('/webhook', methods=['POST'])
 def webhook():
     req = request.get_json()
     intent = req['queryResult']['intent']['displayName']
-    logging.info(f"Incoming intent: {intent}, parameters: {req['queryResult'].get('parameters')}")
+    logging.info(f"\n==============================\n📥 Incoming Intent: {intent}\n==============================")
+    log_input_output_contexts(req)
     handler = INTENT_HANDLERS.get(intent, handle_default)
-    return handler(req)
+    response = handler(req)
+    logging.info(f"📤 Fulfillment response: {response.get_json() if hasattr(response, 'get_json') else response}\n")
+    return response
+
 
 # ===============================
-# 🧪 调试端点
+# 🧪 Debug endpoints
 # ===============================
 @app.route('/debug/test-sheets', methods=['GET'])
 def debug_test_sheets():
@@ -549,6 +783,16 @@ def debug_test_sheets():
     except Exception as e:
         logging.exception("❌ /debug/test-sheets failed")
         return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route('/debug/session', methods=['GET'])
+def debug_session_dump():
+    """Dump in-memory session_store for quick inspection."""
+    try:
+        return jsonify({"ok": True, "session_store": session_store})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 
 if __name__ == '__main__':
     app.run(port=5000, debug=True)
