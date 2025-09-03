@@ -84,6 +84,7 @@ def get_from_ctx(req, ctx_suffix, key): #helps getting data from context
 app = Flask(__name__)
 CORS(app)
 
+
 # ===============================
 # ⏰ Opening hours
 # ===============================
@@ -104,7 +105,12 @@ REQUIRED_HEADERS = ["Student ID", "Category", "Size", "Date", "Time"]
 
 # Check if the room is ready to book
 def _is_ready_to_book(state: dict) -> bool:
-    return bool(state.get("date") and state.get("booking_time") and state.get("room_size"))
+    """All core fields must be present before we can proceed to booking."""
+    return bool(
+        state.get("date") and
+        state.get("booking_time") and
+        state.get("room_size")    
+    )
 
 def _ensure_headers(ws):
     try:
@@ -235,6 +241,19 @@ def collect_by_steps(req):
         "student_id":    get_param_from_steps(req, "student_id",    "awaiting_confirmation"),
     }
 
+# ===============================
+# Friendlier display output
+# ===============================
+ROOM_TYPE_DISPLAY = {
+    "SOLO-1": "Solo room",
+    "DISCUSSION-S": "Small discussion room",
+    "DISCUSSION-M": "Medium discussion room",
+    "DISCUSSION-L": "Large discussion room",
+}
+
+def _display_room_type(code: str) -> str:
+    """Return a friendly display name for an internal room_type code."""
+    return ROOM_TYPE_DISPLAY.get(code, code or "room")
 
 
 
@@ -250,6 +269,7 @@ SNAKE_KEYS = {
     "date": "date",
     "booking_time": "booking_time",
     "time": "time",
+    "room_type": "room_type"
 }
 
 CAMEL_TO_SNAKE = {
@@ -261,6 +281,7 @@ CAMEL_TO_SNAKE = {
     "RoomSize": "room_size",
     "TimePeriod": "booking_time",
     "Date": "date",
+    "roomType": "room_type",
 }
 
 ALLOWED_KEYS = set(SNAKE_KEYS.values())  # allowed schema keys
@@ -403,14 +424,13 @@ RESPONSE = {
         "1️⃣ Check availability\n"
         "2️⃣ Make a booking\n"
         "3️⃣ Cancel a booking\n"
-        "4️⃣ Library information\n\n"
-        "👉 You can type a number or say: 'I want to book tomorrow at 2 PM'."
+        "4️⃣ Library information\n"
     ),
     "already_booked": "⚠ You already booked for that day (one per day).",
     "invalid_date": "⚠ Invalid date format: {}",
     "invalid_time": "⚠ Invalid time format. Please provide both start and end clearly.",
     "outside_hours": "⚠ Booking time must be between 8 AM and 10 PM (or until midnight during exam period).",
-    "too_long": "⚠ You can only book up to 3 hours per session.",
+    "too_long": "⚠ You can only book up to 2 hours per session.",
     "missing_date_checkAvailability": "⚠ Which date do you want to check? Today or tomorrow?",
     "missing_date": "⚠ Please provide a date: today or tomorrow?",
     "missing_time": "⚠ Please provide a time range, e.g. 2 PM to 5 PM.",
@@ -500,7 +520,7 @@ def parse_and_validate_timeperiod(time_period):
         if not (opening_dt <= start_obj < end_obj <= closing_dt):
             return False, RESPONSE['outside_hours'], None, None, None
         duration_hours = (end_obj - start_obj).total_seconds() / 3600.0
-        if duration_hours - 3.0 > 1e-6:
+        if duration_hours - 2.0 > 1e-6:
             return False, RESPONSE['too_long'], None, None, None
         time_str = f"{start_obj.strftime('%I:%M %p')} to {end_obj.strftime('%I:%M %p')}"
         return True, None, time_str, start_obj, end_obj
@@ -508,10 +528,153 @@ def parse_and_validate_timeperiod(time_period):
         logging.exception("Time parsing failed")
         return False, RESPONSE['invalid_time'], None, None, None
 
+# ===============================
+# Room Allocation
+# ===============================
+def _go_back_to_size(req, state, prompt_text):
+    """
+    Move the user back to the 'ProvideRoomSize' step by:
+    - Setting prompt_size context so the size intent can trigger.
+    - Dropping prompt_category/awaiting_confirmation so they don't interfere.
+    Note: we don't need to erase old room_size; the new slot (current turn) will override it.
+    """
+    return jsonify({
+        "fulfillmentText": prompt_text,
+        "outputContexts": _sticky_outcontexts(
+            req,
+            state,
+            extra_ctx=[
+                ("prompt_size", 5),
+                ("prompt_category", 0),
+                (CTX_AWAIT_CONFIRM, 0),
+            ]
+        )
+    })
+
+
+def _size_to_int(room_size):
+    """
+    Best-effort integer headcount from room_size.
+    - If already int, return it.
+    - If label (Small/Medium/Large), map to a representative size.
+    - Else return None (unknown).
+    """
+    if isinstance(room_size, int):
+        return room_size
+
+    if isinstance(room_size, float):
+        # if it's a whole number (1.0, 4.0), round it
+        if room_size.is_integer():
+            return int(room_size)
+        return None  # reject non-whole floats like 2.5
+
+    if isinstance(room_size, str) and room_size.strip().isdigit():
+        return int(room_size.strip())
+
+    return None
+
+def _auto_category_from_size(room_size):
+    """
+    Returns 'solo' when headcount == 1, 'discussion' when >1, or None if unknown.
+    """
+    n = _size_to_int(room_size)
+    if n is None:
+        return None
+    return "solo" if n == 1 else "discussion"
+
+
+def assign_room_if(room_size, room_category):
+    """
+    Decide room_type based on room_size (int) and room_category ("solo"/"discussion").
+    With auto-assignment, no need to check for conflicts anymore.
+    """
+    n = _size_to_int(room_size)
+    cat = (room_category or "").strip().lower()
+
+    if cat == "solo":
+        return {"ok": True, "room_type": "SOLO-1", "capacity": (1, 1), "note": ""}
+
+    if cat == "discussion":
+        if 2 <= n <= 3:
+            return {"ok": True, "room_type": "DISCUSSION-S", "capacity": (2, 3), "note": ""}
+        if 4 <= n <= 6:
+            return {"ok": True, "room_type": "DISCUSSION-M", "capacity": (4, 6), "note": ""}
+        if 7 <= n <= 9:
+            return {"ok": True, "room_type": "DISCUSSION-L", "capacity": (7, 9), "note": ""}
+        return {"ok": False, "room_type": "", "capacity": None,
+                "note": "Discussion rooms support 2–9 people."}
+
+    return {"ok": False, "room_type": "", "capacity": None,
+            "note": "room_category must be SOLO or DISCUSSION."}
+
 
 # ===============================
 # 🤖 Intent Handlers
 # ===============================
+
+def handle_flow(req):
+    """
+    Single flow driver that:
+    - Ensures date, time, size are present (prompts for what's missing).
+    - Validates time period.
+    - Auto-assigns room_category from room_size.
+    - Triggers booking when ready.
+    """
+    state = collect_by_steps(req)
+
+    # 1) Date
+    date_param = state.get("explicit_date") or state.get("date")
+    date_obj = parse_date(date_param)
+    if not date_obj:
+        return jsonify({
+            "fulfillmentText": "📅 Which date would you like to book — today or tomorrow?",
+            "outputContexts": _sticky_outcontexts(req, state)
+        })
+
+    # Normalize date string early so it persists in sticky context
+    state["date"] = date_obj.strftime("%d/%m/%Y")
+
+    # 2) Time
+    if not state.get("booking_time"):
+        return jsonify({
+            "fulfillmentText": "🕒 What time would you like? (e.g., 2 PM to 4 PM)",
+            "outputContexts": _sticky_outcontexts(req, state)
+        })
+
+    ok, msg, time_str, _, _ = parse_and_validate_timeperiod(state["booking_time"])
+    if not ok:
+        return jsonify({
+            "fulfillmentText": msg,
+            "outputContexts": _sticky_outcontexts(req, state)
+        })
+
+    if not state.get("time"):
+        state["time"] = time_str
+
+    # 3) Size
+    if not state.get("room_size"):
+        return jsonify({
+            "fulfillmentText": "👥 How many people will use the room? (e.g., 1 or 3)",
+            "outputContexts": _sticky_outcontexts(req, state)
+        })
+
+    # 4) Auto-assign category from size
+    # logging.debug(f"[room_size raw] type={type(state.get('room_size'))} value={repr(state.get('room_size'))}")
+    auto_cat = _auto_category_from_size(state.get("room_size"))
+    if not auto_cat:
+        return jsonify({
+            "fulfillmentText": "I couldn't understand the group size. Please enter a number (e.g., 1 or 3).",
+            "outputContexts": _sticky_outcontexts(req, state)
+        })
+    state["room_category"] = auto_cat
+
+    # 5) All set → trigger booking
+    return jsonify({
+        "fulfillmentText": f"Great — assigning a {auto_cat.upper()} room and checking availability...",
+        "outputContexts": _sticky_outcontexts(req, state),
+        "followupEventInput": {"name": "EVT_BOOK", "languageCode": "en"}
+    })
+
 
 def handle_welcome(req):
     lines = [ln for ln in RESPONSE['welcome'].split("\n") if ln.strip()]
@@ -603,48 +766,39 @@ def handle_provide_time(req):
 
 
 def handle_provide_size(req):
-    # Read values the same way as date/time handlers
     state = collect_by_steps(req)
-
-    # Expect Dialogflow to have filled 'room_size' (either a number or your @room_size bucket)
     size_val = state.get("room_size")
+
     if size_val in ("", None, []):
         return jsonify({
-            "fulfillmentText": "👥 How many people will use the room? (e.g., 3)",
-            "outputContexts": _sticky_outcontexts(req, state)
+            "fulfillmentText": "How many people will use the room? (e.g., 1 or 3)",
+            "outputContexts": _sticky_outcontexts(req, state, extra_ctx=[("prompt_size", 5)])
         })
 
-    # Just persist what DF gave us; do NOT infer category here
-    # (_sticky_outcontexts writes to booking_info + session_store)
-    return jsonify({
-        "fulfillmentText": "🏷️ Please choose a room category: SOLO or DISCUSSION.",
-        # Nudge the next step's context so ChooseCategory can match easily
-        "outputContexts": _sticky_outcontexts(req, state, extra_ctx=[("prompt_category", 5)])
-    })
-
-
-def handle_choose_category(req):
-    state = collect_by_steps(req)
-
-    cat = (state.get("room_category") or "").strip().lower()
-    if cat not in ("solo", "discussion"):
+    # Auto-assign category from size
+    logging.debug(f"[room_size raw] type={type(state.get('room_size'))} value={repr(state.get('room_size'))}")
+    auto_cat = _auto_category_from_size(size_val)
+    if not auto_cat:
         return jsonify({
-            "fulfillmentText": "🏷️ Please choose: SOLO or DISCUSSION.",
-            "outputContexts": _sticky_outcontexts(req, state)
+            "fulfillmentText": "I couldn't understand the group size. Please enter a number (e.g., 1 or 3).",
+            "outputContexts": _sticky_outcontexts(req, state, extra_ctx=[("prompt_size", 5)])
         })
+    logging.debug(f"[room_size raw] type={type(state.get('room_size'))} value={repr(state.get('room_size'))}")
 
-    # Category set—if all required present, jump to booking
+    state["room_category"] = auto_cat  # persist
+    # Do NOT push prompt_category anymore (we no longer ask for category)
+
     if _is_ready_to_book(state):
         return jsonify({
-            "fulfillmentText": "Great—checking rooms...",
+            "fulfillmentText": f"Got it. Assigning a {auto_cat.upper()} room and checking availability...",
             "outputContexts": _sticky_outcontexts(req, state),
             "followupEventInput": {"name": "EVT_BOOK", "languageCode": "en"}
         })
 
-    # Otherwise ask next info (shouldn’t happen if earlier steps done)
+    # If something else is missing, continue the flow naturally
     return jsonify({
-        "fulfillmentText": "Please provide your 7-digit student ID.",
-        "outputContexts": _sticky_outcontexts(req, state, extra_ctx=[("awaiting_confirmation", 5)])
+        "fulfillmentText": "Noted. Which date would you like to book — today or tomorrow?",
+        "outputContexts": _sticky_outcontexts(req, state)
     })
 
 
@@ -652,37 +806,68 @@ def handle_choose_category(req):
 def handle_book_room(req):
     state = collect_by_steps(req)
 
-    # validate date & time
+    # Validate date & time
     date_obj = parse_date(state.get("date"))
     ok, msg, time_str, _, _ = parse_and_validate_timeperiod(state.get("booking_time"))
     if not date_obj:
-        return jsonify({"fulfillmentText": "⚠ Please provide a valid date (today/tomorrow).",
-                        "outputContexts": _sticky_outcontexts(req, state)})
+        return jsonify({
+            "fulfillmentText": "⚠ Please provide a valid date (today/tomorrow).",
+            "outputContexts": _sticky_outcontexts(req, state)
+        })
     if not ok:
-        return jsonify({"fulfillmentText": msg,
-                        "outputContexts": _sticky_outcontexts(req, state)})
+        return jsonify({
+            "fulfillmentText": msg,
+            "outputContexts": _sticky_outcontexts(req, state)
+        })
 
-    # pretty time string (keep)
     if not state.get("time"):
         state["time"] = time_str
 
-    # DO NOT coerce room_size; keep Dialogflow's value (e.g., "Small" or "3")
     size_text = state.get("room_size")
-
-    # DO NOT auto-infer category here; just keep what user chose earlier
-    cat = (state.get("room_category") or "").strip().lower()
-
-    # normalize date for sheet
     state["date"] = date_obj.strftime("%d/%m/%Y")
-
-    # write back unchanged values
+    size_text = state.get("room_size")
     state["room_size"] = size_text
-    state["room_category"] = cat
+
+    cat = (state.get("room_category") or "").strip().lower()
+    if not cat:
+        cat = _auto_category_from_size(size_text)
+        if not cat:
+            return jsonify({
+                "fulfillmentText": "I couldn't understand the group size. Please enter a number (e.g., 1 or 3).",
+                "outputContexts": _sticky_outcontexts(req, state)
+            })
+        state["room_category"] = cat
+
+    res = assign_room_if(room_size=state.get("room_size"), room_category=state.get("room_category"))
+    if not res["ok"]:
+        return jsonify({
+            "fulfillmentText": res["note"],
+            "outputContexts": _sticky_outcontexts(req, state)
+        })
+    state["room_type"] = res["room_type"]
+
+    # Clean size display (remove .0)
+    size_val = state.get("room_size")
+    if isinstance(size_val, float) and size_val.is_integer():
+        size_display = str(int(size_val))
+    else:
+        size_display = str(size_val)
+
+    # Friendly room type
+    room_type_str = _display_room_type(state.get("room_type"))
+    date_str = state['date']
+    time_str = state['time']
 
     return jsonify({
-        "fulfillmentText": f"Let me confirm: a {size_text} {cat} room on {state['date']} from {state['time']}. Say 'Yes' to confirm or 'No' to cancel.",
-        "outputContexts": _sticky_outcontexts(req, state, extra_ctx=[("awaiting_confirmation", 5)])
-    })
+    "fulfillmentText": (
+        f"Let me confirm your booking: a {room_type_str} "
+        f"for {size_display} person{'s' if size_display != '1' else ''} "
+        f"on {date_str} from {time_str}. "
+        "Say 'Yes' to confirm or 'No' to cancel."
+    ),
+    "outputContexts": _sticky_outcontexts(req, state, extra_ctx=[("awaiting_confirmation", 5)])
+})
+
 
 def handle_confirm_booking(req):
     params = _get_ctx_params(req, CTX_BOOKING)
@@ -741,10 +926,10 @@ INTENT_HANDLERS = {
     'Menu_LibraryInfo': handle_menu_info,
     
     #Check Flow
-    'CheckAvailability_Date': handle_check_availability,
-    'ProvideRoomSize': handle_provide_size,
-    'ProvideTime': handle_provide_time,
-    'ChooseCategory': handle_choose_category,
+    'CheckAvailability_Date': handle_flow,
+    'ProvideRoomSize': handle_flow,
+    'ProvideTime': handle_flow,
+    # 'ChooseCategory': handle_flow,
     
     #Book
     'book_room': handle_book_room,
