@@ -317,26 +317,38 @@ def append_booking_row(bkg):
     ])
 
 
-def find_and_hold_room_for_period(date_obj: date, start_dt: datetime, end_dt: datetime, internal_room_type: str, student_id: str):
-    """Pick the first free room of the requested type and occupy its slots in Schedule.
-       Returns (room_id, slots) or (None, None) if none found.
+def find_and_hold_room_for_period(date_obj: date, start_dt: datetime, end_dt: datetime,
+                                  internal_room_type: str, student_id: str):
+    """
+    Pick the first free room of the requested type and occupy its slots in Schedule.
+
+    Returns (room_id, slots, reason) where:
+      - room_id, slots are None on failure
+      - reason in {None, 'invalid_type', 'already_booked', 'no_availability'}
     """
     slots = slots_from_period(start_dt, end_dt)
     bucket = bucket_from_internal_type(internal_room_type)
     if not bucket:
-        return None, None
+        return None, None, "invalid_type"
 
     dstr = _date_str(date_obj)
-    if has_active_booking(student_id, dstr):
-        return None, None
+
+    # Only enforce the "one per day" rule if we already have a real 7-digit ID.
+    norm_sid = normalize_student_id(student_id)
+    if norm_sid and has_active_booking(norm_sid, dstr):
+        return None, None, "already_booked"
 
     rooms = list_rooms_by_type(bucket)
+    if not rooms:
+        return None, None, "no_availability"
+
     for room_id, room_type, _, _ in rooms:
         row_idx = ensure_schedule_row(dstr, room_id, room_type)
         if slots_free(row_idx, slots):
-            occupy_slots(row_idx, slots, booking_id=f"HOLD:{student_id}")  # hold tied to student
-            return room_id, slots
-    return None, None
+            occupy_slots(row_idx, slots, booking_id=f"HOLD:{norm_sid or student_id}")
+            return room_id, slots, None
+
+    return None, None, "no_availability"
 
 
 def finalize_booking(student_id: str, date_obj: date, start_dt: datetime, end_dt: datetime, internal_room_type: str, room_id: str, slots: list[int]):
@@ -348,8 +360,9 @@ def finalize_booking(student_id: str, date_obj: date, start_dt: datetime, end_dt
     row_idx = ensure_schedule_row(dstr, room_id, bucket_from_internal_type(internal_room_type))
     updates = []
     for a1 in schedule_cells_for_slots(row_idx, slots):
-        updates.append({'range': f"{ws_schedule.title}!{a1}", 'values': [[booking_id]]})
+        updates.append({'range': a1, 'values': [[booking_id]]})
     ws_schedule.batch_update(updates)
+
 
     append_booking_row({
         'booking_id': booking_id,
@@ -363,6 +376,7 @@ def finalize_booking(student_id: str, date_obj: date, start_dt: datetime, end_dt
         'created_at': datetime.now().isoformat(timespec='seconds'),
         'status': 'active'
     })
+    logging.info(f"✅ Booking appended: {booking_id} for student {student_id} on {dstr}")
     return booking_id
 
 
@@ -492,6 +506,35 @@ def _sticky_outcontexts(req, booking_params=None, extra_ctx=None, keep_menu=Fals
         out.append({"name": f"{req['session']}/contexts/{CTX_MENU}", "lifespanCount": 0})
 
     return out
+
+# To clean up student_id input to match google sheet format
+def normalize_student_id(val) -> str | None:
+    """
+    Accepts int/float/str from Dialogflow and returns a clean 7-digit string.
+    - Floats like 1234567.0 → '1234567'
+    - Strings with spaces → stripped
+    - Anything else → None
+    """
+    if val in ("", None, []):
+        return None
+    try:
+        # If it's a float that is effectively an int (e.g., 1234567.0)
+        if isinstance(val, float) and float(val).is_integer():
+            s = str(int(val))
+        elif isinstance(val, (int,)):
+            s = str(val)
+        else:
+            s = str(val).strip()
+            # Common case: "1234567.0" (string) → "1234567"
+            if s.endswith(".0"):
+                s = s[:-2]
+        # Keep only digits (in case NLU adds anything weird)
+        s = "".join(ch for ch in s if ch.isdigit())
+        return s if len(s) == 7 else None
+    except Exception:
+        logging.exception("normalize_student_id failed")
+        return None
+
 
 # ===============================
 # Responses (menu text/format unchanged except hours)
@@ -745,9 +788,20 @@ def handle_book_room(req):
         return jsonify({"fulfillmentText": "⚠ Unsupported group size for available rooms. Please Re-enter the group size (1-9)", "outputContexts": _sticky_outcontexts(req, state)})
 
     # Pick and HOLD a specific room in Schedule
-    room_id, slots = find_and_hold_room_for_period(date_obj, start_dt, end_dt, internal_type, str(state.get("student_id") or "PENDING"))
+    # Pick and HOLD a specific room in Schedule
+    room_id, slots, reason = find_and_hold_room_for_period(
+        date_obj, start_dt, end_dt, internal_type, str(state.get("student_id") or "PENDING")
+    )
+
     if not room_id:
-        return jsonify({"fulfillmentText": "No rooms available for that time.", "outputContexts": _sticky_outcontexts(req, state)})
+        if reason == "already_booked":
+            msg = "⚠ This student ID has already been used in another booking for that day. Try a different ID"
+        elif reason == "invalid_type":
+            msg = "Unsupported group size for available rooms. Please enter a number (e.g., 1 or 3)."
+        else:  # "no_availability" or unknown
+            msg = "No available rooms for this time. Please try a different time or room size."
+        return jsonify({"fulfillmentText": msg, "outputContexts": _sticky_outcontexts(req, state)})
+
 
     state["room_type"] = internal_type
     state["room_id"] = room_id
@@ -801,8 +855,8 @@ def handle_confirm_booking(req):
     _dbg_kv("CONFIRM — PARAMS AFTER MERGE/REBUILD", params)
 
 
-    student_id = params.get('student_id')
-    if not student_id or not str(student_id).isdigit() or len(str(student_id)) != 7:
+    student_id = normalize_student_id(params.get('student_id'))
+    if not student_id:
         return jsonify({
             "fulfillmentText": "Please enter your 7-digit student ID.",
             "outputContexts": _sticky_outcontexts(req, booking_params=params, extra_ctx=[(CTX_AWAIT_CONFIRM, 5)])
@@ -838,12 +892,13 @@ def handle_confirm_booking(req):
         room_id=params['room_id'],
         slots=params['slots']
     )
-    return jsonify({"fulfillmentText": "✅ Your booking has been saved successfully."})
+    return jsonify({"fulfillmentText": "✅ Your booking has been saved successfully. Enter hi to go back to main menu.", "outputContexts": _sticky_outcontexts(req, booking_params={"student_id": None}, extra_ctx=[(CTX_AWAIT_CONFIRM, 0)])})
 
 
 def handle_cancel_booking(req):
     params = _get_ctx_params(req, CTX_BOOKING) or get_stored_params(get_session_id(req))
-    student_id = req.get("queryResult", {}).get("parameters", {}).get("student_id") or params.get("student_id")
+    raw_sid = req.get("queryResult", {}).get("parameters", {}).get("student_id") or params.get("student_id")
+    student_id = normalize_student_id(raw_sid)
     date_param = req.get("queryResult", {}).get("parameters", {}).get("date") or params.get("date")
     date_obj = parse_date(date_param)
 
@@ -853,9 +908,9 @@ def handle_cancel_booking(req):
             "outputContexts": _sticky_outcontexts(req, params)
         })
 
-    ok = cancel_by_student_and_date(str(student_id), date_obj)
+    ok = cancel_by_student_and_date(student_id, date_obj)
     if ok:
-        return jsonify({"fulfillmentText": "Got it. The booking has been cancelled.", "outputContexts": _sticky_outcontexts(req)})
+        return jsonify({"fulfillmentText": f"Got it. The booking for {student_id} on {date_obj.strftime('%d/%m/%Y')} has been cancelled.", "outputContexts": _sticky_outcontexts(req)})
     return jsonify({"fulfillmentText": "No booking found for that student and date.", "outputContexts": _sticky_outcontexts(req)})
 
 
