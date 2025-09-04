@@ -83,6 +83,10 @@ SLOT_MINUTES = 30          # 24 slots/day
 MAX_BOOKING_HOURS = 2      # 2h => 4 slots
 ALLOW_UNTIL_MIDNIGHT = False
 
+# Group size range
+MIN_GROUP = 1
+MAX_GROUP = 9
+
 # Room inventory
 ROOM_COUNTS = {
     "solo": 18,
@@ -198,10 +202,25 @@ def _size_to_int(room_size):
 
 
 def auto_category_from_size(room_size):
+    """
+    Returns 'solo' if size == 1, 'discussion' if 2..9, else None.
+    """
     n = _size_to_int(room_size)
     if n is None:
         return None
+    if not (MIN_GROUP <= n <= MAX_GROUP):
+        return None
     return "solo" if n == 1 else "discussion"
+
+def normalize_room_size(room_size) -> int | None:
+    """
+    Convert Dialogflow value to int in [MIN_GROUP, MAX_GROUP]; else None.
+    """
+    n = _size_to_int(room_size)
+    if n is None:
+        return None
+    return n if (MIN_GROUP <= n <= MAX_GROUP) else None
+
 
 
 def room_type_from_size_and_category(room_size, room_category):
@@ -240,12 +259,20 @@ def ensure_schedule_row(date_str: str, room_id: str, room_type: str) -> int:
 
 
 def schedule_cells_for_slots(row_idx: int, slots: list[int]):
-    ranges = []
-    for s in slots:
-        col = 3 + s  # S1 at column D(4) => 3 + 1
-        ranges.append(gspread.utils.rowcol_to_a1(row_idx, col))
-    logging.debug(f"schedule_cells_for_slots(row={row_idx}, slots={slots}) -> {ranges}")
+    try:
+        row_idx = int(row_idx)
+    except Exception:
+        raise ValueError(f"Invalid row_idx={row_idx}")
 
+    ranges = []
+    for s in slots or []:
+        try:
+            s_int = int(round(s))  # handles 19.0 → 19 and '19' → 19 if already cast upstream
+        except Exception:
+            raise ValueError(f"Invalid slot index in slots: {s}")
+        col = 3 + s_int  # S1 is column D(4) => 3 + 1
+        ranges.append(gspread.utils.rowcol_to_a1(row_idx, int(col)))
+    logging.debug(f"schedule_cells_for_slots(row={row_idx}, slots={slots}) -> {ranges}")
     return ranges
 
 
@@ -350,6 +377,20 @@ def find_and_hold_room_for_period(date_obj: date, start_dt: datetime, end_dt: da
 
     return None, None, "no_availability"
 
+def replace_hold_with_booking(row_idx: int, slots: list[int], booking_id: str):
+    """
+    Replace any HOLD:* value in the targeted cells with booking_id.
+    Safe under the 'single user at a time' assumption in your header.
+    """
+    a1s = schedule_cells_for_slots(row_idx, slots)
+    values = ws_schedule.batch_get(a1s)  # [[cell]] per address
+    updates = []
+    for a1, valwrap in zip(a1s, values):
+        current_val = (valwrap[0][0] if (valwrap and valwrap[0]) else "")
+        if isinstance(current_val, str) and current_val.startswith("HOLD:"):
+            updates.append({'range': a1, 'values': [[booking_id]]})
+    if updates:
+        ws_schedule.batch_update(updates)
 
 def finalize_booking(student_id: str, date_obj: date, start_dt: datetime, end_dt: datetime, internal_room_type: str, room_id: str, slots: list[int]):
     dstr = _date_str(date_obj)
@@ -361,7 +402,9 @@ def finalize_booking(student_id: str, date_obj: date, start_dt: datetime, end_dt
     updates = []
     for a1 in schedule_cells_for_slots(row_idx, slots):
         updates.append({'range': a1, 'values': [[booking_id]]})
-    ws_schedule.batch_update(updates)
+    row_idx = ensure_schedule_row(dstr, room_id, bucket_from_internal_type(internal_room_type))
+    replace_hold_with_booking(row_idx, slots, booking_id)
+
 
 
     append_booking_row({
@@ -551,8 +594,8 @@ RESPONSE = {
     "already_booked": "⚠ You already booked for that day (one per day).",
     "invalid_date": "⚠ Invalid date format: {}",
     "invalid_time": "⚠ Invalid time format. Please provide both start and end clearly.",
-    "outside_hours": "⚠ Booking time must be between 8 AM and 8 PM (or until midnight during exam period). Please Re-enter the booking time ( 2pm - 5pm )",
-    "too_long": "⚠ You can only book up to 2 hours per session. Please Re-enter the booking time.",
+    "outside_hours": "⚠ Booking time must be between 8 AM and 8 PM (or until midnight during exam period).",
+    "too_long": "⚠ You can only book up to 2 hours per session.",
     "missing_date_checkAvailability": "⚠ Which date do you want to check? Today or tomorrow?",
     "missing_date": "⚠ Please provide a date: today or tomorrow?",
     "missing_time": "⚠ Please provide a time range, e.g. 2 PM to 5 PM.",
@@ -674,6 +717,7 @@ def handle_flow(req):
             "outputContexts": _sticky_outcontexts(req, state)
         })
     state["date"] = date_obj.strftime("%d/%m/%Y")
+    state = _invalidate_staged_room_if_inputs_changed(req, state)  # ← add here
 
     # 2) Time
     if not state.get("booking_time"):
@@ -685,8 +729,10 @@ def handle_flow(req):
     ok, msg, time_str, _, _ = parse_and_validate_timeperiod(state["booking_time"])
     if not ok:
         return jsonify({"fulfillmentText": msg, "outputContexts": _sticky_outcontexts(req, state)})
+
     if not state.get("time"):
         state["time"] = time_str
+    state = _invalidate_staged_room_if_inputs_changed(req, state)  # ← and here
 
     # 3) Size
     if not state.get("room_size"):
@@ -695,7 +741,7 @@ def handle_flow(req):
             "outputContexts": _sticky_outcontexts(req, state)
         })
 
-    # 4) Auto-assign category
+    # Validate 1–9 if you added that check; then:
     auto_cat = auto_category_from_size(state.get("room_size"))
     if not auto_cat:
         return jsonify({
@@ -703,12 +749,14 @@ def handle_flow(req):
             "outputContexts": _sticky_outcontexts(req, state)
         })
     state["room_category"] = auto_cat
+    state = _invalidate_staged_room_if_inputs_changed(req, state)  # ← and here
 
     return jsonify({
         "fulfillmentText": f"Great — assigning a {auto_cat.upper()} room and checking availability...",
         "outputContexts": _sticky_outcontexts(req, state),
         "followupEventInput": {"name": "EVT_BOOK", "languageCode": "en"}
     })
+
 
 
 def handle_welcome(req):
@@ -729,7 +777,7 @@ def handle_menu_check(req):
     session_id = get_session_id(req)
     update_session_store(session_id, {"booking_time": ""})
     return jsonify({
-        "fulfillmentText": "Entering availability check. Which date would you like to check (today or tomorrow?)",
+        "fulfillmentText": "Entering availability check. Which date would you like to check — today or tomorrow?",
         "outputContexts": _sticky_outcontexts(req, booking_params={"booking_time": None}),
         "followupEventInput": {"name": "EVT_CHECK", "languageCode": "en"}
     })
@@ -772,10 +820,15 @@ def handle_book_room(req):
     if not ok:
         return jsonify({"fulfillmentText": msg, "outputContexts": _sticky_outcontexts(req, state)})
 
+    # Overwrite with the *current* validated values
     state["date"] = date_obj.strftime('%d/%m/%Y')
     state["time"] = time_str
 
-    # Auto-derive room type
+    # Force-drop any lingering staged data before we hold a room
+    for k in ("room_id", "room_type", "slots", "slots_json"):
+        state.pop(k, None)
+
+    # Auto-derive room type (with your 1–9 validation if present)
     cat = auto_category_from_size(state.get("room_size"))
     if not cat:
         return jsonify({
@@ -785,14 +838,14 @@ def handle_book_room(req):
     state["room_category"] = cat
     internal_type = room_type_from_size_and_category(state.get("room_size"), cat)
     if not internal_type:
-        return jsonify({"fulfillmentText": "⚠ Unsupported group size for available rooms. Please Re-enter the group size (1-9)", "outputContexts": _sticky_outcontexts(req, state)})
+        return jsonify({"fulfillmentText": "Unsupported group size for available rooms.", "outputContexts": _sticky_outcontexts(req, state)})
 
-    # Pick and HOLD a specific room in Schedule
-    # Pick and HOLD a specific room in Schedule
+    logging.info(f"🧮 Holding with start={start_dt}, end={end_dt} (expected slots {(end_dt-start_dt).total_seconds()/1800:.0f})")
+
     room_id, slots, reason = find_and_hold_room_for_period(
         date_obj, start_dt, end_dt, internal_type, str(state.get("student_id") or "PENDING")
     )
-
+    
     if not room_id:
         if reason == "already_booked":
             msg = "⚠ This student ID has already been used in another booking for that day. Try a different ID"
@@ -805,6 +858,8 @@ def handle_book_room(req):
 
     state["room_type"] = internal_type
     state["room_id"] = room_id
+    # Ensure slots are ints before storing
+    slots = [int(round(x)) for x in (slots or [])]
     state["slots"] = slots
     state["slots_json"] = json.dumps(slots)  # survives context round-trip
     _dbg_kv("BOOK_ROOM — STAGED STATE", {
@@ -853,6 +908,15 @@ def handle_confirm_booking(req):
             params["slots"] = []
 
     _dbg_kv("CONFIRM — PARAMS AFTER MERGE/REBUILD", params)
+    # Force slots to ints to avoid gspread TypeError
+    try:
+        params["slots"] = [int(round(x)) for x in (params.get("slots") or [])]
+    except Exception:
+        logging.exception("CONFIRM — bad slots content")
+        return jsonify({
+            "fulfillmentText": "⚠ Booking data corrupted. Please try booking again.",
+            "outputContexts": _sticky_outcontexts(req, params)
+        })
 
 
     student_id = normalize_student_id(params.get('student_id'))
@@ -912,6 +976,33 @@ def handle_cancel_booking(req):
     if ok:
         return jsonify({"fulfillmentText": f"Got it. The booking for {student_id} on {date_obj.strftime('%d/%m/%Y')} has been cancelled.", "outputContexts": _sticky_outcontexts(req)})
     return jsonify({"fulfillmentText": "No booking found for that student and date.", "outputContexts": _sticky_outcontexts(req)})
+
+def _invalidate_staged_room_if_inputs_changed(req, state: dict) -> dict:
+    """
+    If date / booking_time / room_size changed vs. what we had in booking_info,
+    drop any staged room fields so we don't reuse previous holds.
+    """
+    prev = _get_ctx_params(req, CTX_BOOKING) or {}
+    # Normalize to comparable primitives
+    prev_date = prev.get("date") or prev.get("explicit_date")
+    new_date  = state.get("date") or state.get("explicit_date")
+
+    prev_time = prev.get("booking_time")
+    new_time  = state.get("booking_time")
+
+    prev_size = prev.get("room_size")
+    new_size  = state.get("room_size")
+
+    changed = (
+        (prev_date != new_date) or
+        (prev_time != new_time) or
+        (prev_size != new_size)
+    )
+    if changed:
+        for k in ("room_id", "room_type", "slots", "slots_json"):
+            state.pop(k, None)
+        logging.debug("🧹 Inputs changed — invalidated staged room_id/room_type/slots.")
+    return state
 
 
 def handle_cancel_after_confirmation(req):
