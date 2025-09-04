@@ -508,8 +508,8 @@ RESPONSE = {
     "already_booked": "⚠ You already booked for that day (one per day).",
     "invalid_date": "⚠ Invalid date format: {}",
     "invalid_time": "⚠ Invalid time format. Please provide both start and end clearly.",
-    "outside_hours": "⚠ Booking time must be between 8 AM and 8 PM (or until midnight during exam period).",
-    "too_long": "⚠ You can only book up to 2 hours per session.",
+    "outside_hours": "⚠ Booking time must be between 8 AM and 8 PM (or until midnight during exam period). Please Re-enter the booking time ( 2pm - 5pm )",
+    "too_long": "⚠ You can only book up to 2 hours per session. Please Re-enter the booking time.",
     "missing_date_checkAvailability": "⚠ Which date do you want to check? Today or tomorrow?",
     "missing_date": "⚠ Please provide a date: today or tomorrow?",
     "missing_time": "⚠ Please provide a time range, e.g. 2 PM to 5 PM.",
@@ -686,7 +686,7 @@ def handle_menu_check(req):
     session_id = get_session_id(req)
     update_session_store(session_id, {"booking_time": ""})
     return jsonify({
-        "fulfillmentText": "Entering availability check. Which date would you like to check — today or tomorrow?",
+        "fulfillmentText": "Entering availability check. Which date would you like to check (today or tomorrow?)",
         "outputContexts": _sticky_outcontexts(req, booking_params={"booking_time": None}),
         "followupEventInput": {"name": "EVT_CHECK", "languageCode": "en"}
     })
@@ -742,7 +742,7 @@ def handle_book_room(req):
     state["room_category"] = cat
     internal_type = room_type_from_size_and_category(state.get("room_size"), cat)
     if not internal_type:
-        return jsonify({"fulfillmentText": "Unsupported group size for available rooms.", "outputContexts": _sticky_outcontexts(req, state)})
+        return jsonify({"fulfillmentText": "⚠ Unsupported group size for available rooms. Please Re-enter the group size (1-9)", "outputContexts": _sticky_outcontexts(req, state)})
 
     # Pick and HOLD a specific room in Schedule
     room_id, slots = find_and_hold_room_for_period(date_obj, start_dt, end_dt, internal_type, str(state.get("student_id") or "PENDING"))
