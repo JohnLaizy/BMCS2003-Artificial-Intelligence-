@@ -34,6 +34,8 @@ from dateutil import parser
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from oauth2client.service_account import ServiceAccountCredentials
+# --- retry helpers ---
+from requests.exceptions import SSLError, ConnectionError, ReadTimeout
 
 # ===============================
 # Logging
@@ -90,6 +92,25 @@ def _dbg_kv(label: str, obj: dict):
             logging.debug("  • %s = %r  (type=%s)", k, v, t)
     except Exception:
         logging.exception("debug print failed for %s", label)
+        
+def _with_retries(fn, *args, **kwargs):
+    """
+    Call a function that performs a Google Sheets request, with retries
+    for transient HTTPS/TLS/network errors.
+    Env:
+      SHEETS_RETRY_ATTEMPTS (default 5)
+      SHEETS_RETRY_BASE     (default 0.4 seconds)
+    """
+    import time
+    max_attempts = int(os.getenv("SHEETS_RETRY_ATTEMPTS", "5"))
+    base = float(os.getenv("SHEETS_RETRY_BASE", "0.4"))
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn(*args, **kwargs)
+        except (SSLError, ConnectionError, ReadTimeout):
+            if attempt == max_attempts:
+                raise
+            time.sleep(base * (2 ** (attempt - 1)))
 
 
 # ===============================
@@ -197,7 +218,7 @@ ws_bookings = _ensure_worksheet(WS_BOOKINGS, HEADERS_BOOKINGS)
 
 
 def _seed_rooms_if_empty():
-    values = ws_rooms.get_all_values()
+    values = _with_retries(ws_rooms.get_all_values)
     if len(values) > 1:
         return
     rows = []
@@ -209,7 +230,8 @@ def _seed_rooms_if_empty():
         rows.append([f"M-{i:02d}", "medium", 4, 6])
     for i in range(1, ROOM_COUNTS["large"] + 1):
         rows.append([f"L-{i:02d}", "large", 7, 9])
-    ws_rooms.append_rows(rows)
+    _with_retries(ws_rooms.append_rows, rows)
+
 
 
 _seed_rooms_if_empty()
@@ -317,7 +339,7 @@ def slots_free(row_idx: int, slots: List[int]) -> bool:
     runs = _coalesce_slots(slots)
     for s, e in runs:
         a1 = _slot_run_to_a1_range(row_idx, s, e)
-        block_wrapped = ws_schedule.batch_get([a1])
+        block_wrapped = _with_retries(ws_schedule.batch_get, [a1])
         block = block_wrapped[0] if block_wrapped else []
         for row in block:
             for cell in row:
@@ -335,7 +357,7 @@ def occupy_slots(row_idx: int, slots: List[int], booking_id: str):
         updates.append({"range": a1, "values": [[booking_id] * width]})
     logging.debug("occupy_slots() updating ranges: %s", [u["range"] for u in updates])
     if updates:
-        ws_schedule.batch_update(updates)
+        _with_retries(ws_schedule.batch_update, updates)
 
 
 def free_slots(row_idx: int, slots: List[int]):
@@ -355,7 +377,7 @@ def _bookings_list_with_row_indexes():
     Returns a list of tuples (row_idx, rec_dict) for Bookings.
     row_idx is 1-based; header is row 1.
     """
-    values = ws_bookings.get_all_values()  # 1 call
+    values = _with_retries(ws_bookings.get_all_values)
     if not values:
         return []
     header = values[0]
@@ -365,6 +387,13 @@ def _bookings_list_with_row_indexes():
         rec = dict(zip(header, row + [None] * (len(header) - len(row))))
         out.append((r_idx, rec))
     return out
+
+def _align_time_to_date(start_dt: datetime, end_dt: datetime, date_obj: date):
+    """Force start/end to the given date (keep hour/minute)."""
+    s = start_dt.replace(year=date_obj.year, month=date_obj.month, day=date_obj.day)
+    e = end_dt.replace(year=date_obj.year, month=date_obj.month, day=date_obj.day)
+    return s, e
+
 
 
 class ScheduleIndex:
@@ -376,7 +405,7 @@ class ScheduleIndex:
 
     def _load_all_for_date(self, date_str: str):
         """Build {room_id -> row_idx} for a given date with ONE API call."""
-        values = self.ws.get_all_values()
+        values = _with_retries(self.ws.get_all_values)
         idx_map: Dict[str, int] = {}
         for r_idx in range(2, len(values) + 1):
             row = values[r_idx - 1]
@@ -399,7 +428,7 @@ class ScheduleIndex:
         Do ONE append_rows for all missing rooms, auto-grow if needed.
         """
         idx_map = self.get_map(date_str)
-        room_records = self.ws_rooms.get_all_records(expected_headers=HEADERS_ROOMS)
+        room_records = _with_retries(self.ws_rooms.get_all_records, expected_headers=HEADERS_ROOMS)
         bucket_rooms: List[Tuple[str, str]] = [
             (r["room_id"], r["room_type"]) for r in room_records if r.get("room_type") == bucket
         ]
@@ -411,11 +440,11 @@ class ScheduleIndex:
         current_rows = self.ws.row_count
         needed_rows = len(missing)
         if current_rows - 1 < needed_rows:
-            self.ws.add_rows(max(100, needed_rows))
+            _with_retries(self.ws.add_rows, max(100, needed_rows))
 
         empty_slots = ["" for _ in range(24)]
         to_append = [[date_str, rid, rtype] + empty_slots for rid, rtype in missing]
-        self.ws.append_rows(to_append)
+        _with_retries(self.ws.append_rows, to_append)
         self._load_all_for_date(date_str)
 
     @staticmethod
@@ -445,7 +474,7 @@ def _slot_range_a1(row_idx: int, slot_l: int, slot_r: int) -> str:
 # Room picking
 # ===============================
 def list_rooms_by_type(room_bucket: str) -> List[Tuple[str, str, int, int]]:
-    data = ws_rooms.get_all_records(expected_headers=HEADERS_ROOMS)
+    data = _with_retries(ws_rooms.get_all_records, expected_headers=HEADERS_ROOMS)
     out = []
     for r in data:
         if r.get("room_type") == room_bucket:
@@ -466,7 +495,7 @@ def bucket_from_internal_type(internal_code: str) -> str:
 # Booking + cancellation (Sheets)
 # ===============================
 def has_active_booking(student_id: str, date_str: str) -> bool:
-    rows = ws_bookings.get_all_records(expected_headers=HEADERS_BOOKINGS)
+    rows = _with_retries(ws_bookings.get_all_records, expected_headers=HEADERS_BOOKINGS)
     for r in rows:
         if str(r.get("student_id")) == str(student_id) and r.get("date") == date_str and r.get("status") == "active":
             return True
@@ -474,7 +503,7 @@ def has_active_booking(student_id: str, date_str: str) -> bool:
 
 
 def append_booking_row(bkg: dict):
-    ws_bookings.append_row([
+    _with_retries(ws_bookings.append_row, [
         bkg["booking_id"], bkg["student_id"], bkg["date"], bkg["start_time"], bkg["end_time"],
         bkg["room_type"], bkg["room_id"], json.dumps(bkg["slots"]), bkg["created_at"], bkg["status"]
     ])
@@ -510,7 +539,7 @@ def find_and_hold_room_for_period(date_obj: date, start_dt: datetime, end_dt: da
     sched_ix.ensure_rows_for_bucket(dstr, bucket)
 
     idx_map = sched_ix.get_map(dstr)
-    room_records = ws_rooms.get_all_records(expected_headers=HEADERS_ROOMS)
+    room_records = _with_retries(ws_rooms.get_all_records, expected_headers=HEADERS_ROOMS)
     candidate_room_ids = [r["room_id"] for r in room_records if r.get("room_type") == bucket and r["room_id"] in idx_map]
     if not candidate_room_ids:
         return None, None, "no_availability"
@@ -523,7 +552,8 @@ def find_and_hold_room_for_period(date_obj: date, start_dt: datetime, end_dt: da
         rows_for_room[rid] = row_idx
         ranges.append(_slot_range_a1(row_idx, sL, sR))
 
-    blocks = ws_schedule.batch_get(ranges)
+    blocks = _with_retries(ws_schedule.batch_get, ranges)
+
 
     chosen_room = None
     for (rid, row_idx), block in zip(rows_for_room.items(), blocks):
@@ -546,7 +576,8 @@ def find_and_hold_room_for_period(date_obj: date, start_dt: datetime, end_dt: da
     hold_tag = f"HOLD:{norm_sid or student_id}"
 
     updates = [{"range": a1, "values": [[hold_tag]]} for a1 in ScheduleIndex.slots_to_a1(row_idx, slots)]
-    ws_schedule.batch_update(updates)
+    _with_retries(ws_schedule.batch_update, updates)
+
 
     return room_id, slots, None
 
@@ -559,7 +590,7 @@ def replace_hold_with_booking(row_idx: int, slots: List[int], booking_id: str):
     updates = []
     for s, e in _coalesce_slots(slots):
         a1 = _slot_run_to_a1_range(row_idx, s, e)
-        block_wrapped = ws_schedule.batch_get([a1])
+        block_wrapped = _with_retries(ws_schedule.batch_get, [a1])
         block = block_wrapped[0] if block_wrapped else []
         new_values = []
         for row in block:
@@ -572,7 +603,8 @@ def replace_hold_with_booking(row_idx: int, slots: List[int], booking_id: str):
             new_values.append(row_out)
         updates.append({"range": a1, "values": new_values})
     if updates:
-        ws_schedule.batch_update(updates)
+        _with_retries(ws_schedule.batch_update, updates)
+
 
 
 def finalize_booking(student_id: str, date_obj: date, start_dt: datetime, end_dt: datetime,
@@ -649,7 +681,7 @@ def cancel_by_student_and_date(student_id: str, date_obj: date) -> int:
         for a1 in ScheduleIndex.slots_to_a1(row_idx, slots):
             clear_updates.append({"range": a1, "values": [[""]]})
     if clear_updates:
-        ws_schedule.batch_update(clear_updates)
+        _with_retries(ws_schedule.batch_update, clear_updates)
 
     status_col = HEADERS_BOOKINGS.index("status") + 1
     status_updates = []
@@ -658,7 +690,8 @@ def cancel_by_student_and_date(student_id: str, date_obj: date) -> int:
         a1 = gspread.utils.rowcol_to_a1(r_idx, status_col)
         status_updates.append({"range": a1, "values": [["cancelled"]]})
     if status_updates:
-        ws_bookings.batch_update(status_updates)
+        _with_retries(ws_bookings.batch_update, status_updates)
+
 
     return len(matches)
 
@@ -672,7 +705,8 @@ def ensure_schedule_row(date_str: str, room_id: str, room_type_bucket: str) -> i
     if room_id in m:
         return m[room_id]
     empty_slots = ["" for _ in range(24)]
-    ws_schedule.append_row([date_str, room_id, room_type_bucket] + empty_slots)
+    _with_retries(ws_schedule.append_row, [date_str, room_id, room_type_bucket] + empty_slots)
+
     ix._load_all_for_date(date_str)
     return ix.get_map(date_str)[room_id]
 
@@ -1022,6 +1056,7 @@ def handle_flow(req):
             "outputContexts": _sticky_outcontexts(req, state, keep_menu=True, extra_ctx=[("prompt_time", 3)]),
         })
 
+    start_dt, end_dt = _align_time_to_date(start_dt, end_dt, date_obj)
     _commit_valid_time(state, start_dt, end_dt, time_str)
     state["time"] = time_str
     state = _invalidate_staged_room_if_inputs_changed(req, state)
@@ -1260,6 +1295,7 @@ def handle_confirm_booking(req):
     ok, _, _, start_dt, end_dt = parse_and_validate_timeperiod(params.get("booking_time"))
     if not ok:
         return jsonify({"fulfillmentText": "Time invalid.", "outputContexts": _sticky_outcontexts(req, params)})
+    start_dt, end_dt = _align_time_to_date(start_dt, end_dt, date_obj)
 
     required = (params.get("room_type"), params.get("room_id"))
     slots_ok = isinstance(params.get("slots"), list) and len(params["slots"]) > 0
