@@ -811,7 +811,7 @@ RESPONSE = {
     ),
     "library_info": (
         "📚 Library Information:\n"
-        "🕘 Opening Hours: 8:00 AM – 10:00 PM daily (extended until midnight during exam periods).\n"
+        "🕘 Opening Hours: 8:00 AM – 8:00 PM daily (extended until midnight during exam periods).\n"
         "📚 Borrowing Rules: Students can borrow up to 5 books for 14 days. Renewal is allowed online if no reservations exist. Overdue items incur daily fines.\n"
         "🛎 Help Desk: Assistance is available at the Service Counter (Level G) for borrowing, membership, or locating resources.\n"
         "👥 Discussion Rooms: 15 rooms available (1–3 pax, 3–6 pax, 6–9 pax). Each booking is limited to 3 hours per session.\n"
@@ -1157,7 +1157,14 @@ def handle_menu_cancel(req):
     })
 
 def handle_menu_info(req):
-    return jsonify({"fulfillmentText": RESPONSE["library_info"]})
+    lines = [ln for ln in RESPONSE['library_info'].split("\n") if ln.strip()]
+    return jsonify({
+        "fulfillmentMessages": [
+            {"text": {"text": [ln]}} for ln in lines
+        ],
+        "outputContexts": _sticky_outcontexts(req)  # keep contexts sticky
+    })
+
 
 def handle_book_room(req):
     state = collect_by_steps(req)
