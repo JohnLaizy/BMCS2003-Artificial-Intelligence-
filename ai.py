@@ -809,7 +809,7 @@ RESPONSE = {
         "3️⃣ Cancel a booking\n"
         "4️⃣ Library information\n"
     ),
-    "Library_Info_Response": (
+    "library_info": (
         "📚 Library Information:\n"
         "🕘 Opening Hours: 8:00 AM – 10:00 PM daily (extended until midnight during exam periods).\n"
         "📚 Borrowing Rules: Students can borrow up to 5 books for 14 days. Renewal is allowed online if no reservations exist. Overdue items incur daily fines.\n"
@@ -833,7 +833,6 @@ RESPONSE = {
     "cancel": "🖑 Your booking has been cancelled.",
     "unknown": "Sorry, I didn't understand that.",
     "cancel_confirm": "Got it. The booking has been cancelled.",
-    "library_info": "Library hours: 8:00 AM - 8:00 PM daily. Solo rooms fit 1 person; discussion rooms fit 2-9 people."
 }
 
 # ===============================
