@@ -1,5 +1,6 @@
-flask
+Flask
 flask-cors
-gspread 
+gspread
 oauth2client
 python-dateutil
+gunicorn

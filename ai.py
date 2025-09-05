@@ -987,55 +987,69 @@ def _is_ready_to_book(state: dict) -> bool:
     return bool(state.get("date") and state.get("booking_time") and state.get("room_size"))
 
 def handle_flow(req):
+    """
+    CheckAvailability (single driver)
+    - Never re-asks for everything.
+    - If date missing -> ask for date only.
+    - If time missing/invalid -> ask for time only (preserve date/size).
+    - If size missing -> ask for size only.
+    - When all valid -> set category, stage, then EVT_BOOK.
+    """
     state = collect_by_steps(req)
 
-    # 1) Date
+    # ---- 1) Date: only ask if missing ----
     date_param = state.get("explicit_date") or state.get("date")
     date_obj = parse_date(date_param)
     if not date_obj:
         return jsonify({
             "fulfillmentText": "📅 Which date would you like to book — today or tomorrow?",
-            "outputContexts": _sticky_outcontexts(req, state)
+            "outputContexts": _sticky_outcontexts(req, state, keep_menu=True)
         })
     state["date"] = date_obj.strftime("%d/%m/%Y")
+
+    # If inputs changed since last turn, drop only staged room artifacts
     state = _invalidate_staged_room_if_inputs_changed(req, state)
 
-    # 2) Time
+    # ---- 2) Time: only ask/re-ask for time if missing/invalid ----
     if not state.get("booking_time"):
         return jsonify({
             "fulfillmentText": "🕒 What time would you like? (e.g., 2 PM to 4 PM)",
-            "outputContexts": _sticky_outcontexts(req, state)
+            "outputContexts": _sticky_outcontexts(req, state, keep_menu=True, extra_ctx=[("prompt_time", 3)])
         })
 
     ok, msg, time_str, start_dt, end_dt = parse_and_validate_timeperiod(state["booking_time"])
     if not ok:
-        return jsonify({"fulfillmentText": msg, "outputContexts": _sticky_outcontexts(req, state)})
+        # Only re-prompt for time; keep existing date/size in sticky context
+        return jsonify({
+            "fulfillmentText": f"⏱ {msg or 'Please provide a valid time range (e.g., 2 PM to 4 PM).'}",
+            "outputContexts": _sticky_outcontexts(req, state, keep_menu=True, extra_ctx=[("prompt_time", 3)])
+        })
 
     _commit_valid_time(state, start_dt, end_dt, time_str)
-
-    if not state.get("time"):
-        state["time"] = time_str
+    state["time"] = time_str
     state = _invalidate_staged_room_if_inputs_changed(req, state)
 
-    # 3) Size
+    # ---- 3) Group size: only ask if missing ----
     if not state.get("room_size"):
         return jsonify({
             "fulfillmentText": "👥 How many people will use the room? (e.g., 1 or 3)",
-            "outputContexts": _sticky_outcontexts(req, state)
+            "outputContexts": _sticky_outcontexts(req, state, keep_menu=True)
         })
 
+    # Validate size & derive category
     auto_cat = auto_category_from_size(state.get("room_size"))
     if not auto_cat:
         return jsonify({
-            "fulfillmentText": "I couldn't understand the group size. Please enter a number (e.g., 1 or 3).",
-            "outputContexts": _sticky_outcontexts(req, state)
+            "fulfillmentText": "I couldn't understand the group size. Please enter a number between 1 and 9.",
+            "outputContexts": _sticky_outcontexts(req, state, keep_menu=True)
         })
     state["room_category"] = auto_cat
     state = _invalidate_staged_room_if_inputs_changed(req, state)
 
+    # ---- 4) All good → proceed to booking (no extra prompts here) ----
     return jsonify({
-        "fulfillmentText": f"Great — assigning a {auto_cat.upper()} room and checking availability...",
-        "outputContexts": _sticky_outcontexts(req, state),
+        "fulfillmentText": f"Great — assigning a {auto_cat.upper()} room and checking availability…",
+        "outputContexts": _sticky_outcontexts(req, state, keep_menu=True),
         "followupEventInput": {"name": "EVT_BOOK", "languageCode": "en"}
     })
 
@@ -1352,9 +1366,8 @@ def handle_cancel_booking(req):
 
     n = cancel_by_student_and_date(student_id, date_obj)
     if n > 0:
-        s = "booking" if n == 1 else "bookings"
         return jsonify({
-            "fulfillmentText": f"Got it. {n} {s} for {student_id} on {date_obj.strftime('%d/%m/%Y')} {'has' if n==1 else 'have'} been cancelled.",
+            "fulfillmentText": f"Got it. Booking for {student_id} on {date_obj.strftime('%d/%m/%Y')} {'has' if n==1 else 'have'} been cancelled.",
             "outputContexts": _sticky_outcontexts(req, booking_params={"student_id": student_id})
         })
     else:
