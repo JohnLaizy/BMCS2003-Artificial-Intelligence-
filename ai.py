@@ -326,14 +326,7 @@ def free_slots(row_idx: int, slots: list[int]):
     if updates:
         ws_schedule.batch_update(updates)
         
-class ScheduleIndex:
-    def __init__(self, ws, ws_rooms):
-        self.ws = ws
-        self.ws_rooms = ws_rooms
-        self.index_by_date: Dict[str, Dict[str, int]] = {}  # date_str -> {room_id: row_idx}
-        self.row_count_snapshot = None
-
-    def _bookings_list_with_row_indexes():
+def _bookings_list_with_row_indexes():
         """
         Returns a list of tuples (row_idx, rec_dict) for Bookings.
         row_idx is 1-based; header is row 1.
@@ -348,6 +341,13 @@ class ScheduleIndex:
             rec = dict(zip(header, row + [None] * (len(header) - len(row))))
             out.append((r_idx, rec))
         return out
+        
+class ScheduleIndex:
+    def __init__(self, ws, ws_rooms):
+        self.ws = ws
+        self.ws_rooms = ws_rooms
+        self.index_by_date: Dict[str, Dict[str, int]] = {}  # date_str -> {room_id: row_idx}
+        self.row_count_snapshot = None
 
 
     def _load_all_for_date(self, date_str: str):
