@@ -809,7 +809,7 @@ RESPONSE = {
         "3️⃣ Cancel a booking\n"
         "4️⃣ Library information\n"
     ),
-    "Library_Info": (
+    "Library_Info_Response": (
         "📚 Library Information:\n"
         "🕘 Opening Hours: 8:00 AM – 10:00 PM daily (extended until midnight during exam periods).\n"
         "📚 Borrowing Rules: Students can borrow up to 5 books for 14 days. Renewal is allowed online if no reservations exist. Overdue items incur daily fines.\n"
@@ -1387,7 +1387,7 @@ def handle_cancel_after_confirmation(req):
     return jsonify({"fulfillmentText": RESPONSE['cancel_confirm'], "outputContexts": _sticky_outcontexts(req)})
 
 def handle_library_info(req):
-    return jsonify({"fulfillmentText": RESPONSE["Library_Info"], "outputContexts": _sticky_outcontexts(req)})
+    return jsonify({"fulfillmentText": RESPONSE["Library_Info_Response"], "outputContexts": _sticky_outcontexts(req)})
 
 def handle_default(req):
     return jsonify({"fulfillmentText": RESPONSE['unknown']})
