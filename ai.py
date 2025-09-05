@@ -1305,7 +1305,7 @@ def handle_cancel_after_confirmation(req):
     return jsonify({"fulfillmentText": RESPONSE['cancel_confirm'], "outputContexts": _sticky_outcontexts(req)})
 
 def handle_library_info(req):
-    return jsonify({"fulfillmentText": RESPONSE["library_info"], "outputContexts": _sticky_outcontexts(req)})
+    return jsonify({"fulfillmentText": RESPONSE["Library_Info"], "outputContexts": _sticky_outcontexts(req)})
 
 def handle_default(req):
     return jsonify({"fulfillmentText": RESPONSE['unknown']})
