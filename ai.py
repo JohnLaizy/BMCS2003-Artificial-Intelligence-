@@ -28,6 +28,8 @@ import uuid
 from datetime import datetime, date, time as dtime, timedelta
 import time
 from typing import Dict, List, Tuple
+import os
+import json
 
 # ===============================
 # Logging
@@ -134,7 +136,13 @@ scope = [
     'https://www.googleapis.com/auth/spreadsheets',
     'https://www.googleapis.com/auth/drive'
 ]
-creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
+GOOGLE_SA_JSON = os.getenv("GOOGLE_SA_JSON")
+if not GOOGLE_SA_JSON:
+    raise RuntimeError("Missing GOOGLE_SA_JSON env var")
+
+creds = ServiceAccountCredentials.from_json_keyfile_dict(
+    json.loads(GOOGLE_SA_JSON), scope
+)
 client = gspread.authorize(creds)
 sh = client.open(SHEET_TITLE)
 
