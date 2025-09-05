@@ -591,6 +591,14 @@ RESPONSE = {
         "3️⃣ Cancel a booking\n"
         "4️⃣ Library information\n"
     ),
+    "Library_Info": (
+        "📚 Library Information:\n"
+        "🕘 Opening Hours: 8:00 AM – 10:00 PM daily (extended until midnight during exam periods).\n"
+        "📚 Borrowing Rules: Students can borrow up to 5 books for 14 days. Renewal is allowed online if no reservations exist. Overdue items incur daily fines.\n"
+        "🛎 Help Desk: Assistance is available at the Service Counter (Level G) for borrowing, membership, or locating resources.\n"
+        "👥 Discussion Rooms: 15 rooms available (1–3 pax, 3–6 pax, 6–9 pax). Each booking is limited to 3 hours per session.\n"
+        "🎫 Lost Student ID: Report immediately to the service counter to deactivate your account and apply for a replacement card."
+    ),
     "already_booked": "⚠ You already booked for that day (one per day).",
     "invalid_date": "⚠ Invalid date format: {}",
     "invalid_time": "⚠ Invalid time format. Please provide both start and end clearly.",
