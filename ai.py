@@ -333,6 +333,23 @@ class ScheduleIndex:
         self.index_by_date: Dict[str, Dict[str, int]] = {}  # date_str -> {room_id: row_idx}
         self.row_count_snapshot = None
 
+    def _bookings_list_with_row_indexes():
+        """
+        Returns a list of tuples (row_idx, rec_dict) for Bookings.
+        row_idx is 1-based; header is row 1.
+        """
+        values = ws_bookings.get_all_values()  # 1 call
+        if not values:
+            return []
+        header = values[0]
+        out = []
+        for r_idx in range(2, len(values) + 1):
+            row = values[r_idx - 1]
+            rec = dict(zip(header, row + [None] * (len(header) - len(row))))
+            out.append((r_idx, rec))
+        return out
+
+
     def _load_all_for_date(self, date_str: str):
         """Build {room_id -> row_idx} for a given date with ONE API call."""
         values = self.ws.get_all_values()  # A..all, all rows (1 call)
@@ -581,22 +598,79 @@ def finalize_booking(student_id: str, date_obj: date, start_dt: datetime, end_dt
     logging.info(f"✅ Booking appended: {booking_id} for student {student_id} on {dstr}")
     return booking_id
 
-def cancel_by_student_and_date(student_id: str, date_obj: date) -> bool:
+def cancel_by_student_and_date(student_id: str, date_obj: date) -> int:
+    """
+    Batched cancellation:
+      - Finds ALL active bookings for (student_id, date) in one read
+      - Clears all their slots in Schedule via ONE batch_update
+      - Marks all as 'cancelled' via ONE batch_update
+    Returns: number of bookings cancelled (0 if none).
+    """
     dstr = _date_str(date_obj)
-    data = ws_bookings.get_all_values()
-    for r in range(2, len(data) + 1):
-        row = ws_bookings.row_values(r)
-        if not row:
+    sid = str(student_id)
+
+    # 1) Read Bookings with row indexes (1 API call)
+    rows = _bookings_list_with_row_indexes()
+    matches = []
+    for r_idx, rec in rows:
+        if (rec.get("student_id") == sid and
+            rec.get("date") == dstr and
+            (rec.get("status") or "").lower() == "active"):
+            # normalize slots list
+            try:
+                slots = json.loads(rec.get("slots_json") or "[]")
+                slots = [int(round(x)) for x in slots]
+            except Exception:
+                slots = []
+            matches.append({
+                "bookings_row_idx": r_idx,
+                "room_id": rec.get("room_id") or "",
+                "room_type": rec.get("room_type") or "",
+                "slots": slots
+            })
+
+    if not matches:
+        return 0
+
+    # 2) Build/ensure index for Schedule ONCE (≤2 calls including row ensure if you want)
+    sched_ix = ScheduleIndex(ws_schedule, ws_rooms)
+    idx_map = sched_ix.get_map(dstr)  # 0–1 call (cached per object)
+
+    # 3) Collect schedule clear-updates across ALL matches (ONE batch_update)
+    clear_updates = []
+    for m in matches:
+        rid = m["room_id"]
+        slots = m["slots"]
+        if not rid or not slots:
             continue
-        rec = dict(zip(HEADERS_BOOKINGS, row + [None]*(len(HEADERS_BOOKINGS)-len(row))))
-        if rec.get('student_id') == str(student_id) and rec.get('date') == dstr and rec.get('status') == 'active':
-            room_id = rec.get('room_id')
-            slots = json.loads(rec.get('slots_json') or '[]')
-            row_idx = ensure_schedule_row(dstr, room_id, '')
-            free_slots(row_idx, slots)
-            ws_bookings.update_cell(r, HEADERS_BOOKINGS.index('status') + 1, 'cancelled')
-            return True
-    return False
+
+        row_idx = idx_map.get(rid)
+        if not row_idx:
+            # If row missing for some reason, you can skip; there’s nothing to clear.
+            # If you want to be strict and create then clear, uncomment:
+            # row_idx = ensure_schedule_row(dstr, rid, bucket_from_internal_type(m["room_type"]))
+            # idx_map = sched_ix.get_map(dstr)  # refresh
+            continue
+
+        for a1 in ScheduleIndex.slots_to_a1(row_idx, slots):
+            clear_updates.append({"range": a1, "values": [[""]]})
+
+    if clear_updates:
+        ws_schedule.batch_update(clear_updates)  # 1 call to clear all cells
+
+    # 4) Mark all matched bookings as 'cancelled' with ONE batch_update
+    # Find the status column index
+    status_col = HEADERS_BOOKINGS.index("status") + 1  # 1-based
+    status_updates = []
+    for m in matches:
+        r_idx = m["bookings_row_idx"]
+        a1 = gspread.utils.rowcol_to_a1(r_idx, status_col)
+        status_updates.append({"range": a1, "values": [["cancelled"]]})
+
+    if status_updates:
+        ws_bookings.batch_update(status_updates)  # 1 call
+
+    return len(matches)
 
 # ===============================
 # Dialogflow helpers: contexts & state
@@ -1270,10 +1344,18 @@ def handle_cancel_booking(req):
             "outputContexts": _sticky_outcontexts(req, params)
         })
 
-    ok = cancel_by_student_and_date(student_id, date_obj)
-    if ok:
-        return jsonify({"fulfillmentText": f"Got it. The booking for {student_id} on {date_obj.strftime('%d/%m/%Y')} has been cancelled.", "outputContexts": _sticky_outcontexts(req)})
-    return jsonify({"fulfillmentText": "No booking found for that student and date.", "outputContexts": _sticky_outcontexts(req)})
+    n = cancel_by_student_and_date(student_id, date_obj)
+    if n > 0:
+        s = "booking" if n == 1 else "bookings"
+        return jsonify({
+            "fulfillmentText": f"Got it. {n} {s} for {student_id} on {date_obj.strftime('%d/%m/%Y')} {'has' if n==1 else 'have'} been cancelled.",
+            "outputContexts": _sticky_outcontexts(req, booking_params={"student_id": student_id})
+        })
+    else:
+        return jsonify({
+            "fulfillmentText": "No active booking found for that student and date.",
+            "outputContexts": _sticky_outcontexts(req, booking_params={"student_id": student_id})
+        })
 
 def _invalidate_staged_room_if_inputs_changed(req, state: dict) -> dict:
     """
