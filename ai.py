@@ -1035,7 +1035,7 @@ def handle_flow(req):
     date_obj = parse_date(date_param)
     if not date_obj:
         return jsonify({
-            "fulfillmentText": "📅 Which date would you like to book — today or tomorrow?",
+            "fulfillmentText": "📅 Please input the date — today or tomorrow?",
             "outputContexts": _sticky_outcontexts(req, state, keep_menu=True),
         })
     state["date"] = date_obj.strftime("%d/%m/%Y")
