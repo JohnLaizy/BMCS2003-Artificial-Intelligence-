@@ -1464,11 +1464,14 @@ def debug_session_dump():
         return jsonify({"ok": True, "session_store": session_store})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
-
+    
+@app.get("/health")
+def health():
+    return "ok", 200
 
 # ===============================
 # Local run (Render uses gunicorn)
 # ===============================
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
+    port = int(os.getenv("PORT", "100000"))
     app.run(host="0.0.0.0", port=port, debug=os.getenv("FLASK_DEBUG", "false").lower() == "true")
