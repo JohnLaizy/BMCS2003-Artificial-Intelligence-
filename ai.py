@@ -173,21 +173,46 @@ _scope = [
 
 
 def _load_service_account():
+    """
+    Load Google SA credentials from:
+      1) GOOGLE_SA_JSON            -> JSON string
+      2) GOOGLE_SA_JSON_B64        -> base64-encoded JSON
+      3) GOOGLE_SA_KEYFILE         -> path to keyfile (legacy/local)
+      4) GOOGLE_APPLICATION_CREDENTIALS -> standard Google path (legacy)
+
+    Raises RuntimeError if none are provided.
+    """
     sa_json = os.getenv("GOOGLE_SA_JSON")
-    sa_b64 = os.getenv("GOOGLE_SA_JSON_B64")
+    sa_b64  = os.getenv("GOOGLE_SA_JSON_B64")
+
+    # 1) Raw JSON in env
+    if sa_json:
+        try:
+            return json.loads(sa_json)
+        except Exception:
+            logging.exception("Failed to parse GOOGLE_SA_JSON")
+            raise RuntimeError("GOOGLE_SA_JSON is not valid JSON")
+
+    # 2) Base64 JSON in env
     if sa_b64 and not sa_json:
         try:
-            sa_json = base64.b64decode(sa_b64).decode("utf-8")
+            decoded = base64.b64decode(sa_b64).decode("utf-8")
+            return json.loads(decoded)
         except Exception:
-            logging.exception("Failed to base64-decode GOOGLE_SA_JSON_B64")
+            logging.exception("Failed to decode/parse GOOGLE_SA_JSON_B64")
             raise RuntimeError("Invalid GOOGLE_SA_JSON_B64")
-    if not sa_json:
-        raise RuntimeError("Missing GOOGLE_SA_JSON (or GOOGLE_SA_JSON_B64) env var")
-    try:
-        return json.loads(sa_json)
-    except Exception:
-        logging.exception("Failed to parse GOOGLE_SA_JSON")
-        raise RuntimeError("GOOGLE_SA_JSON is not valid JSON")
+
+    # 3/4) Legacy/local: file path envs
+    keyfile = os.getenv("GOOGLE_SA_KEYFILE") or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if keyfile and os.path.exists(keyfile):
+        try:
+            with open(keyfile, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            logging.exception("Failed to read service account keyfile at %s", keyfile)
+            raise RuntimeError("Service account keyfile is unreadable")
+
+    raise RuntimeError("Missing GOOGLE_SA_JSON / GOOGLE_SA_JSON_B64 / GOOGLE_SA_KEYFILE / GOOGLE_APPLICATION_CREDENTIALS")
 
 
 _creds = ServiceAccountCredentials.from_json_keyfile_dict(_load_service_account(), _scope)
@@ -1473,5 +1498,5 @@ def health():
 # Local run (Render uses gunicorn)
 # ===============================
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "100000"))
+    port = int(os.getenv("PORT", "10000"))
     app.run(host="0.0.0.0", port=port, debug=os.getenv("FLASK_DEBUG", "false").lower() == "true")
