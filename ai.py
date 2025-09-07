@@ -112,6 +112,27 @@ def _with_retries(fn, *args, **kwargs):
                 raise
             time.sleep(base * (2 ** (attempt - 1)))
 
+# ===============================
+# Carry-over helpers (persist partial inputs)
+# ===============================
+CARRY_KEYS = (
+    "date", "explicit_date", "booking_time", "room_size",
+    "room_category", "student_id", "room_type", "room_id",
+    "slots", "time"
+)
+
+def _carry_turn_params_to_store(req) -> dict:
+    """
+    Persist any non-empty parameters from this turn into session_store
+    so future intents (like EVT_CHECK -> CheckAvailability) can reuse them.
+    checkAvailability wont ask for all the data again, only ask for missing ones.
+    """
+    turn_params = (req.get("queryResult", {}) or {}).get("parameters", {}) or {}
+    carry = {k: v for k, v in turn_params.items() if k in CARRY_KEYS and v not in ("", None, [])}
+    if carry:
+        update_session_store(get_session_id(req), carry)
+    return carry
+
 
 # ===============================
 # Business rules
@@ -418,6 +439,47 @@ def _align_time_to_date(start_dt: datetime, end_dt: datetime, date_obj: date):
     s = start_dt.replace(year=date_obj.year, month=date_obj.month, day=date_obj.day)
     e = end_dt.replace(year=date_obj.year, month=date_obj.month, day=date_obj.day)
     return s, e
+
+def release_hold_for_state(date_obj: date, room_id: str, slots: List[int], sid: str | None = None) -> int:
+    """
+    Clears HOLD cells for the given (date, room_id, slots).
+    If sid is provided, only clears HOLD:<sid>; otherwise clears any HOLD:*.
+    Returns number of cells cleared.
+    """
+    if not (date_obj and room_id and slots):
+        return 0
+
+    dstr = _date_str(date_obj)
+    sched_ix = ScheduleIndex(ws_schedule, ws_rooms)
+    idx_map = sched_ix.get_map(dstr)
+    row_idx = idx_map.get(room_id)
+    if not row_idx:
+        return 0
+
+    cleared = 0
+    # Walk contiguous runs to minimize API calls
+    for s, e in _coalesce_slots(slots):
+        a1 = _slot_run_to_a1_range(row_idx, s, e)
+        block_wrapped = _with_retries(ws_schedule.batch_get, [a1])
+        block = block_wrapped[0] if block_wrapped else []
+
+        new_values = []
+        for row in block:
+            row_out = []
+            for cell in row:
+                if isinstance(cell, str) and cell.startswith("HOLD:"):
+                    if (sid is None) or (cell == f"HOLD:{sid}"):
+                        row_out.append("")
+                        cleared += 1
+                    else:
+                        row_out.append(cell)
+                else:
+                    row_out.append(cell)
+            new_values.append(row_out)
+
+        _with_retries(ws_schedule.batch_update, [{"range": a1, "values": new_values}])
+
+    return cleared
 
 
 
@@ -792,17 +854,26 @@ def get_param_from_steps(req, key, step_ctx_suffix, booking_ctx="booking_info"):
 
 
 def collect_by_steps(req):
+    """
+    Prefer: current turn params -> step specific ctx -> booking_info ctx -> session_store
+    """
+    store = get_stored_params(get_session_id(req)) or {}
+
+    def _pick(key, step_ctx_suffix):
+        v = get_param_from_steps(req, key, step_ctx_suffix)   # turn / step ctx / booking ctx
+        return v if v not in ("", None, []) else store.get(key)
+
     return {
-        "date": get_param_from_steps(req, "date", "prompt_time"),
-        "explicit_date": get_param_from_steps(req, "explicit_date", "prompt_time"),
-        "booking_time": get_param_from_steps(req, "booking_time", "prompt_size"),
-        "room_size": get_param_from_steps(req, "room_size", "prompt_category"),
-        "room_category": get_param_from_steps(req, "room_category", "awaiting_confirmation"),
-        "student_id": get_param_from_steps(req, "student_id", "awaiting_confirmation"),
-        "room_type": get_param_from_steps(req, "room_type", "awaiting_confirmation"),
-        "room_id": get_param_from_steps(req, "room_id", "awaiting_confirmation"),
-        "slots": get_param_from_steps(req, "slots", "awaiting_confirmation"),
-        "time": get_param_from_steps(req, "time", "awaiting_confirmation"),
+        "date":           _pick("date", "prompt_time"),
+        "explicit_date":  _pick("explicit_date", "prompt_time"),
+        "booking_time":   _pick("booking_time", "prompt_size"),
+        "room_size":      _pick("room_size", "prompt_category"),
+        "room_category":  _pick("room_category", "awaiting_confirmation"),
+        "student_id":     _pick("student_id", "awaiting_confirmation"),
+        "room_type":      _pick("room_type", "awaiting_confirmation"),
+        "room_id":        _pick("room_id", "awaiting_confirmation"),
+        "slots":          _pick("slots", "awaiting_confirmation"),
+        "time":           _pick("time", "awaiting_confirmation"),
     }
 
 
@@ -1110,6 +1181,15 @@ def handle_flow(req):
 
 
 def handle_welcome(req):
+    # cleanup of any staged HOLD from a previous attempt
+    try:
+        st = collect_by_steps(req)
+        if st.get("date") and st.get("room_id") and st.get("slots"):
+            date_obj = datetime.strptime(st["date"], "%d/%m/%Y").date()
+            sid = normalize_student_id(st.get("student_id")) or "PENDING"
+            release_hold_for_state(date_obj, st["room_id"], [int(round(x)) for x in (st["slots"] or [])], sid=sid)
+    except Exception:
+        logging.exception("Welcome cleanup failed")
     session_id = get_session_id(req)
     session_store[session_id] = {"booking_info": {}}
     lines = [ln for ln in RESPONSE["welcome"].split("\n") if ln.strip()]
@@ -1126,6 +1206,8 @@ def handle_welcome(req):
 
 
 def handle_menu_check(req):
+    # carry over any existing params from menu context to booking_info context
+    _carry_turn_params_to_store(req)
     state = collect_by_steps(req)
     date_obj = parse_date(state.get("explicit_date") or state.get("date"))
     ok_time, _msg_time, time_str, start_dt, end_dt = parse_and_validate_timeperiod(state.get("booking_time"))
@@ -1154,6 +1236,8 @@ def handle_menu_check(req):
 
 
 def handle_menu_book(req):
+    # carry over any existing params from menu context to booking_info context
+    _carry_turn_params_to_store(req)
     state = collect_by_steps(req)
     date_obj = parse_date(state.get("explicit_date") or state.get("date"))
     ok_time, _msg_time, time_str, start_dt, end_dt = parse_and_validate_timeperiod(state.get("booking_time"))
@@ -1202,7 +1286,7 @@ def handle_book_room(req):
     ok, msg, time_str, start_dt, end_dt = parse_and_validate_timeperiod(state.get("booking_time"))
     if not date_obj:
         return jsonify({
-            "fulfillmentText": "⚠ Please provide a valid date (today/tomorrow or dd/mm/YYYY).",
+            "fulfillmentText": "⚠ Please provide a valid date (today/tomorrow).",
             "outputContexts": _sticky_outcontexts(req, state),
         })
     if not ok:
@@ -1361,7 +1445,7 @@ def handle_cancel_booking(req):
 
     if not (student_id and date_obj):
         return jsonify({
-            "fulfillmentText": "Please provide your 7-digit student ID and the date to cancel (today/tomorrow or dd/mm/YYYY).",
+            "fulfillmentText": "Please provide your 7-digit student ID and the date to cancel (today/tomorrow).",
             "outputContexts": _sticky_outcontexts(req, params),
         })
 
@@ -1402,7 +1486,33 @@ def _invalidate_staged_room_if_inputs_changed(req, state: dict) -> dict:
 
 
 def handle_cancel_after_confirmation(req):
-    return jsonify({"fulfillmentText": RESPONSE["cancel_confirm"], "outputContexts": _sticky_outcontexts(req)})
+    # Pull the staged state from contexts/store
+    params = collect_by_steps(req)
+    try:
+        # Parse staged pieces
+        date_str = params.get("date")
+        room_id = params.get("room_id")
+        slots = params.get("slots") or []
+        sid = normalize_student_id(params.get("student_id")) or "PENDING"
+
+        date_obj = datetime.strptime(date_str, "%d/%m/%Y").date() if date_str else None
+
+        # Attempt to clear any HOLDs we placed for this staged selection
+        cleared = release_hold_for_state(date_obj, room_id, [int(round(x)) for x in slots], sid=sid)
+        logging.info("🧹 Cancel-after-confirmation: cleared %s HOLD cells for room %s on %s",
+                     cleared, room_id, date_str)
+    except Exception:
+        logging.exception("Cancel-after-confirmation cleanup failed")
+
+    # Reset staged fields so we don't reuse a stale hold
+    reset = dict(params)
+    for k in ("room_id", "room_type", "slots", "slots_json", "booking_time"):
+        reset.pop(k, None)
+
+    return jsonify({
+        "fulfillmentText": RESPONSE["cancel_confirm"],
+        "outputContexts": _sticky_outcontexts(req, booking_params=reset),
+    })
 
 
 def handle_library_info(req):
@@ -1442,6 +1552,8 @@ def webhook():
         raw_turn_params = req.get("queryResult", {}).get("parameters", {}) or {}
         _dbg_kv("RAW TURN PARAMS", raw_turn_params)
         logging.info("==============================📥 Incoming Intent: %s ==============================", intent)
+
+        update_session_store(get_session_id(req), raw_turn_params)
 
         handler = INTENT_HANDLERS.get(intent, handle_default)
 
