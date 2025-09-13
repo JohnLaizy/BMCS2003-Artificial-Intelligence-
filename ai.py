@@ -866,7 +866,7 @@ def collect_by_steps(req):
     return {
         "date":           _pick("date", "prompt_time"),
         "explicit_date":  _pick("explicit_date", "prompt_time"),
-        "booking_time":   _pick("booking_time", "prompt_size"),
+        "booking_time":   _pick("booking_time", "prompt_time"),
         "room_size":      _pick("room_size", "prompt_category"),
         "room_category":  _pick("room_category", "awaiting_confirmation"),
         "student_id":     _pick("student_id", "awaiting_confirmation"),
@@ -1132,7 +1132,7 @@ def handle_flow(req):
     if not date_obj:
         return jsonify({
             "fulfillmentText": "📅 Please input the date — today or tomorrow?",
-            "outputContexts": _sticky_outcontexts(req, state, keep_menu=True),
+            "outputContexts": _sticky_outcontexts(req, state, keep_menu=True, extra_ctx=[("prompt_time", 3)]),
         })
     state["date"] = date_obj.strftime("%d/%m/%Y")
 
